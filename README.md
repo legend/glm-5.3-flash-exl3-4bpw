@@ -7,6 +7,7 @@ license_name: shapleymcg-1.0
 license_link: https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/blob/main/LICENSE
 tags:
   - glm
+  - glm-5.3-flash
   - exl3
   - tr3
   - vllm
@@ -14,246 +15,172 @@ tags:
   - nvfp4
   - dflash2
   - multimodal
+  - abliterated
 ---
 
-# GLM-5.3-Flash TR3 4bpw — current SM120 runtime
+# GLM-5.3-Flash TR3 4bpw — upstream-core port (r1)
 
-This is the uniform-K4 EXL3/TR3 routed-expert checkpoint for GLM-5.3-Flash.
-The current v84 runtime supports three explicit TP2/EP2/DCP2 profiles on two
-SM120 GPUs: multimodal DFlash2, language-only DFlash2, and language-only MTP3.
-All use calibrated NVFP4 MLA KV and CUDA graphs. This is a custom vLLM/B12X
-build and is not compatible with stock upstream vLLM.
+Fork of [brandonmmusic-max/glm-5.3-flash-exl3-4bpw](https://github.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw)
+carrying a **complete upstream engine-core port plus ~90 bug fixes**, a fixed
+serving recipe, and the abliterated checkpoint option.
 
-## Encoder reproducibility closure
+What this fork changes relative to the v84 baseline it is built on:
 
-The repository now contains the complete, hash-verified R10 Python encoder
-closure used by the EXL3/MCG adapter, including
-`r7_encoder/r10_codec.py` (`R10TrellisCodec`) and the pinned
-`lineage/encode_tr3_v31.py` numeric core. It is published under
-[`reproducibility/r10/`](reproducibility/r10/) with a per-file SHA-256
-manifest and an offline verifier:
+1. **Engine core replaced** — the scheduler, KV-cache pool/coordinator,
+   interface, runners (V1+V2), worker chain, speculators, and rejection
+   sampler are ported from the upstream
+   [local-inference-lab/vllm](https://github.com/local-inference-lab/vllm)
+   PR-head lineage (5f8e00d6c3 composition), with ~60 fork-compat bridges so
+   they interoperate with the v84 in-image model-side files. The engine core
+   itself is `engine-core/core.py` (the v84 core + the prefill-throttle
+   patch, equivalent to upstream PR#546).
+2. **~90 bugs fixed**, root-caused via differential debugging against the
+   v84 oracle (full history in [README-PATCHES.md](README-PATCHES.md)). The
+   headline item: the sparse-MLA layer-view aliasing bug — long contexts
+   past ~7.8k tokens read another *layer's* KV (silent corruption or Xid
+   31/43 GPU faults). Fixed with layer-contiguous bucket emission, a proven
+   collision-free parasitic pairing (mamba/KpoolTail twin geometry), the
+   b12x record-walk view-faithful stride fix, and ~20 H2D lifetime fixes.
+3. **Abliterated checkpoint support** — the production recipe serves
+   [lovesenko/GLM-5.3-Flash-tr3-4bpw-Abliterated](https://huggingface.co/lovesenko/GLM-5.3-Flash-tr3-4bpw-Abliterated).
+   Either checkpoint (censored or abliterated) works; set `GLM53_MODEL_PATH`.
+4. **New serving recipe** — vision + tools + MTP3 + prefix caching, with the
+   thinking-disable fixes (see credits) and v84-default CUDA-graph capture
+   sizes.
+5. **Thinking-disable fix** — `thinking:{type:disabled}` / `thinking:false` /
+   `"disabled"` (top-level *and* `chat_template_kwargs`) now actually disables
+   reasoning. Previously these were silently ignored and, when thinking ran
+   past `max_tokens`, the response came back with `content: null` and
+   `finish_reason: length` — which looks like a broken serve.
 
-```bash
-python3 reproducibility/r10/verify_bundle.py
-```
-
-The bundle is byte-identical to the immutable prior-control source at Hugging
-Face revision `7c73450f05a151439d0f184f216b1eefcc394a31`. It contains the
-portable Python/numeric source, not a compiled `exllamav3_ext`; that binary
-must still be built for the target PyTorch, CUDA, and SM ABI and is independently
-hash-bound by the adapter. See the [bundle README](reproducibility/r10/README.md)
-for the exact adapter paths, lineage boundary, and licensing.
-
-## Pick a serving profile
-
-| Goal | Launcher | Extra checkpoint | Measured KV tokens |
-|---|---|---|---:|
-| Images plus fastest measured C1 decode | `compose.sm120-tp2.yaml` | DFlash2-7 | 129,473 |
-| Text-only DFlash2 decode | `compose.sm120-tp2-language-only-dflash2.yaml` | DFlash2-7 | 184,619 |
-| **Text-only capacity/default** | **`compose.sm120-tp2-language-only.yaml`** | **none; built-in MTP3** | **1,376,256** |
-
-The MTP3 option means the model's built-in MTP head only: it does not load or
-mount the external DFlash checkpoint. Choose DFlash2 when its modest C1 decode
-gain matters more than resident context/concurrency; choose MTP3 for the normal
-text-only daily driver.
-
-## Run the current image
-
-```text
-verdictai/glm53-flash-exl3-k4:r19-sm120-tp2-ep2-dcp2-v84-dflash2
-OCI digest: sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
-```
-
-The runtime image does not contain either checkpoint. Download/mount this
-EXL3 model and `incoai/GLM-5.3-Flash-DFlash2` separately. The DFlash2
-checkpoint is distributed under CC-BY-NC-ND-4.0; review its license before use.
-
-Docker Compose:
+## Quick start
 
 ```bash
-curl -L -o compose.sm120-tp2.yaml \
-  https://raw.githubusercontent.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/main/runtime/compose.sm120-tp2.yaml
+# Build the image (same recipe as the original: digest-pinned v84 base + overlay)
+git clone https://github.com/legend/glm-5.3-flash-exl3-4bpw
+cd glm-5.3-flash-exl3-4bpw
+./build.sh     # -> legend/glm53-flash-exl3-k4:r1-upstream-core-port
+# or: docker pull legend/glm53-flash-exl3-k4:r1-upstream-core-port
 
-GLM53_MODEL_PATH=/absolute/path/to/GLM-5.3-Flash-tr3-4bpw \
-GLM53_DFLASH_PATH=/absolute/path/to/GLM-5.3-Flash-DFlash2 \
-docker compose -f compose.sm120-tp2.yaml up -d
+# Download a checkpoint (either):
+#   hf download brandonmusic/GLM-5.3-Flash-tr3-4bpw --local-dir ...
+#   hf download lovesenko/GLM-5.3-Flash-tr3-4bpw-Abliterated --local-dir ...
 
+GLM53_MODEL_PATH=/path/to/checkpoint \
+GLM53_CACHE_PATH=/path/to/cache \
+docker compose -f runtime/compose.sm120-tp2-ported.yaml up -d
 curl http://127.0.0.1:8012/v1/models
 ```
 
-Standalone serve script:
+Overlay-style (bind-mounts, matches production exactly) is also supported —
+see `runtime/serve-glm53-sm120-tp2-ported.sh`.
 
-```bash
-curl -L -o serve-glm53-sm120-tp2.sh \
-  https://raw.githubusercontent.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/main/runtime/serve-glm53-sm120-tp2.sh
-chmod +x serve-glm53-sm120-tp2.sh
+## Current recipe (production serving profile)
 
-MODEL=/absolute/path/to/GLM-5.3-Flash-tr3-4bpw \
-DFLASH_MODEL=/absolute/path/to/GLM-5.3-Flash-DFlash2 \
-GPU_DEVICES=0,1 \
-./serve-glm53-sm120-tp2.sh
-```
+| | |
+|---|---|
+| TP / EP / DCP | 2 / 2 / 2 (a2a) |
+| Attention / MoE | B12X_MLA_SPARSE / b12x |
+| KV cache | nvfp4_ds_mla (288 B/token) |
+| Speculation | MTP3 (built-in head, probabilistic) |
+| Vision / tools | on / on (glm45 reasoning + glm47 tool parsers) |
+| Context | 262,144 |
+| Batch / seqs | 2048 / 8 |
+| CUDA-graph capture | [1,2,4,8,16,24,32,40,48,56,64] (v84 default) |
+| KV pool | 1,747,626 tokens (6.67x @ full 262k requests) |
 
-The published profile has a 98,304-token request ceiling and allocated 129,473
-KV tokens on the qualified pair. Its hybrid Mamba/DFlash rollback layout has
-room for one full resident request; additional requests queue. C2/C4 rows in
-the raw benchmark are therefore capacity-limited and are not throughput claims.
-
-## Language-only profile
-
-For text serving, use the language-only profile. It disables the vision tower
-and uses the built-in MTP3 head by default, avoiding a second external
-checkpoint and leaving substantially more room for KV cache:
-
-```bash
-curl -L -o compose.sm120-tp2-language-only.yaml \
-  https://raw.githubusercontent.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/main/runtime/compose.sm120-tp2-language-only.yaml
-
-GLM53_MODEL_PATH=/absolute/path/to/GLM-5.3-Flash-tr3-4bpw \
-docker compose -f compose.sm120-tp2-language-only.yaml up -d
-```
-
-Standalone:
-
-```bash
-curl -L -o serve-glm53-sm120-tp2-language-only.sh \
-  https://raw.githubusercontent.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/main/runtime/serve-glm53-sm120-tp2-language-only.sh
-chmod +x serve-glm53-sm120-tp2-language-only.sh
-
-MODEL=/absolute/path/to/GLM-5.3-Flash-tr3-4bpw \
-GPU_DEVICES=0,1 \
-./serve-glm53-sm120-tp2-language-only.sh
-```
-
-To keep DFlash2 while disabling vision, use the separate speed-first launcher:
-
-```bash
-curl -L -o compose.sm120-tp2-language-only-dflash2.yaml \
-  https://raw.githubusercontent.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/main/runtime/compose.sm120-tp2-language-only-dflash2.yaml
-
-GLM53_MODEL_PATH=/absolute/path/to/GLM-5.3-Flash-tr3-4bpw \
-GLM53_DFLASH_PATH=/absolute/path/to/GLM-5.3-Flash-DFlash2 \
-docker compose -f compose.sm120-tp2-language-only-dflash2.yaml up -d
-```
-
-Its standalone equivalent is
-[`serve-glm53-sm120-tp2-language-only-dflash2.sh`](runtime/serve-glm53-sm120-tp2-language-only-dflash2.sh).
-
-The language-only alias points to the same tested v84 code digest:
-
-```text
-verdictai/glm53-flash-exl3-k4:r19-sm120-tp2-ep2-dcp2-v84-language-only
-OCI digest: sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
-```
-
-Measured capacity on the same two 96 GB GPUs at 300 W each:
-
-| Runtime profile | Vision | Speculator | KV tokens | Concurrency at tested ceiling |
-|---|:---:|---|---:|---:|
-| Multimodal DFlash2-7, 98,304 max | on | external 7-layer draft | 129,473 | 1.32x |
-| Language-only DFlash2-7, 98,304 max | off | external 7-layer draft | 184,619 | 1.88x |
-| **Language-only MTP3, 131,072 max** | **off** | **built-in head** | **1,376,256** | **10.50x** |
-
-Turning vision off raises the DFlash KV token pool by 42.6%. The much larger
-7.45x language-only gain comes from using the built-in MTP head instead of
-keeping the external DFlash2-7 model resident. It is not a vision-only gain.
-The language-only profiles do not accept image inputs. The reported KV-token
-pool is total allocated capacity, not a promise that every request can use the
-entire pool; the configured per-request ceiling and scheduler concurrency still
-apply.
-
-## Current measured results
-
-Qualified on two RTX PRO 6000 Blackwell Workstation Edition GPUs (96 GB each),
-TP2/EP2/DCP2, NVFP4 MLA KV, prefix cache off, and DFlash2-7. The current quick
-speed pass used 600 W limits and +6000 MHz memory offsets. Generation uses the
-model defaults (`temperature=1.0`, `top_p=0.95`); the acceptance comparison uses
-`reasoning_effort=max`.
+Measured on 2x RTX PRO 6000 Blackwell (96 GB), stock clocks:
 
 | Measurement | Result |
 |---|---:|
-| Cold prefill, 32K | **6,225 client / 6,277 server tok/s** |
-| Cold prefill, 64K | **6,083 client / 6,130 server tok/s** |
-| C1 decode, empty context | **145.5 tok/s** |
-| C1 decode, 32K context | **147.2 tok/s** |
-| C1 decode, 64K context | **151.5 tok/s** |
-| DFlash2 acceptance, 5 distinct GSM8K prompts | **5.428 mean / 5.441 token-weighted; 5/5 correct** |
-| DFlash2 acceptance, GSM8K first 16 | **5.739 mean / 5.550 token-weighted** |
-| DFlash2 acceptance, published reference | 5.78 mean over 128 samples |
-| Image smoke | **pass** — correctly identified a mallard |
+| C1 decode (graphed, MTP3) | 147–157 tok/s |
+| Prefill | ~4,700 tok/s aggregate (8.4 s TTFT @ 33k, 25.6 s @ 100k) |
+| Long-context retrieval | 150k tokens, exact mid-document quote — pass |
+| Crash repro (was: Xid 31/43 in <=90 s) | clean, 5-round soak |
 
-The clean C1 decode run used a 4,096-token completion budget so the client did
-not roll into the next prefill request. A prior 60.1 tok/s row was a harness
-rollover artifact and is excluded. The DFlash acceptance fix is material: the partially ported Triton mask scored
-1.017 weighted. Restoring the reference semantics—full bidirectional visibility
-inside the draft block with a backward-only historical window—raised the same
-five-seed probe to 5.068 and the exact GSM8K sample to 5.739. Synthetic padded
-long-context decode accepts roughly 2.8–3.0 tokens/step, while five distinct
-GSM8K reasoning prompts accepted 4.89–6.03 and all answered correctly; acceptance
-is workload-dependent.
+The deterministic crash shape (warm ~400k + two concurrent 140k multi-turn
+sessions) killed every pre-fix configuration; it now passes a 5-round soak
+with zero Xids. Full evidence trail: [README-PATCHES.md](README-PATCHES.md).
 
-Receipts: [600 W prefill JSON](runtime-results/v84/benchmarks/llm-decode-c1-prefill32k64k-600w.json),
-[600 W prefill TUI](runtime-results/v84/benchmarks/llm-decode-c1-prefill32k64k-600w.tui.log),
-[clean 600 W C1 decode JSON](runtime-results/v84/benchmarks/llm-decode-c1-clean-4096-600w.json),
-[clean 600 W C1 decode TUI](runtime-results/v84/benchmarks/llm-decode-c1-clean-4096-600w.tui.log),
-[earlier C1-C4 benchmark](runtime-results/v84/benchmarks/llm-decode-c1-c4-64k.json),
-[acceptance rows](runtime-results/v84/quality/gsm8k-first16-max-acceptance.jsonl),
-[distinct-prompt acceptance](runtime-results/v84/quality/gsm8k-distinct5-language-only-acceptance.json),
-[language-only capacity](runtime-results/v84/validation/language-only-capacity.json),
-and [release validation](runtime-results/v84/validation/release.json).
+## Thinking control (all forms verified live)
 
-## Quality and KLD
-
-v84 changes draft speculation, Triton draft-attention semantics, and vision
-packaging; it does not change target-model weights, EXL3 kernels, calibrated
-MLA KV scales, or target logits. The current target-quality receipts therefore
-remain the repeatedly qualified v75 measurements:
-
-| Test | Result |
-|---|---:|
-| FP8 MLA KV KLD, five-run full 2,047-position mean | **0.024610591221** |
-| NVFP4 MLA KV KLD, five-run full 2,047-position mean | **0.054757372223** |
-| Estonia 10x, NVFP4 | **10/10** |
-| LAVD-low 10x, FP8 | **8/10 accepted** |
-| LAVD-low 10x, NVFP4 | **3/10 accepted** — failed quality gate |
-| Needle through 500K, NVFP4 | **17/18 raw; final cell passed on longer retry** |
-
-KLD was measured in eager/no-speculation mode against the sealed BF16 teacher
-over every causal position in the 2,048-token window. Draft acceptance does not
-alter that target-logit measurement. Hotel was explicitly stopped and is not
-presented as a current result.
-
-Receipts: [v75 KLD and quality evidence](runtime-results/v75/). Older tuning
-history is retained in [the historical model card](docs/HISTORICAL_MODEL_CARD_2026-08-27.md),
-not mixed into the current launch path.
-
-## Vision and implementation notes
-
-The image fixes a packaging defect where GLM-5.3 vision RoPE unconditionally
-imported `vllm.vllm_flash_attn.layers.rotary` even when a custom wheel shipped
-only the compiled flash-attention extensions. It now uses native PyTorch RoPE
-as a correctness fallback. Cold multimodal warmup and a real remote-JPEG chat
-request both passed.
-
-The target path remains the fused uniform-K4 EXL3 route-128 SMEM/register
-kernel. SM120 in this build does not use a TMEM/TCGEN path. DFlash uses Triton
-attention because its noncausal sliding-window semantics are now tested there.
-
-## Provenance and attribution
-
-The image embeds `/opt/glm53/PROVENANCE.json` and OCI source, author,
-documentation, revision, checkpoint, and validation labels. The manifest binds
-the runtime source and benchmark artifacts with SHA-256 hashes. This is a
-transparent provenance fingerprint: there is no telemetry, callback, hidden
-output watermark, or inference modification.
-
-```bash
-curl -L -o verify-provenance.sh \
-  https://raw.githubusercontent.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/main/runtime/verify-provenance.sh
-chmod +x verify-provenance.sh
-./verify-provenance.sh
+```json
+{"thinking": {"type": "disabled"}}   // top-level Zai form
+{"thinking": false}                  // top-level short form
+{"chat_template_kwargs": {"enable_thinking": false}}
 ```
+All three disable reasoning and return clean content with `finish_reason:
+stop`. Without the fix, these were silently dropped and produced
+`content: null` at small `max_tokens`.
 
-This checkpoint is distributed under the ShapleyMCG License 1.0 in
-[LICENSE](LICENSE). Credit goes to turboderp for EXL3, IncoAI for DFlash2, and
-Local Inference Lab contributors for the runtime foundation.
+## What was fixed (summary)
+
+See [README-PATCHES.md](README-PATCHES.md) for the full 8-category history
+with evidence. The short list:
+
+- **Sparse-MLA layer-view aliasing** (root cause of the Xid 31/43 family):
+  12 sparse-MLA layer views were emitted one page apart while each claimed
+  the full pool — every token past 7,808 read another layer's KV. Fixed via
+  layer-contiguous bucket emission with a collision-freeness proof.
+- **b12x record-walk stride** derived from caller scalars instead of the
+  emitted view strides — a manager-level scalar silently replaced the
+  kernel-page pair. Now view-faithful.
+- **~20 H2D lifetime sites**: pinned host temps died at scope exit with
+  non-blocking DMAs in flight → torn metadata (idx_mapping arrived as a
+  host-pointer fragment — proven at value level).
+- **Indexer write-path block-table translation** (dropped by the port,
+  restored), per-chunk `.item()` device syncs removed (now beats v84), the
+  1321 MB/lane prefill buffer right-sized to 132 MB.
+- **Gather bounds clamps** (logprobs / vocab / drafter) — torn metadata now
+  degrades to a valid lookup instead of an OOB access.
+- **Rejection-sampler padding mask** (a port regression that "verified"
+  garbage rows) restored.
+- **Perf**: v84-default capture sizes, all debug probes env-gated
+  zero-cost-when-off.
+
+## Credits
+
+- **Brandon Music (brandonmmusic-max)** — the original EXL3 4bpw quant, the
+  v84 runtime base image this fork builds on, and the original serving
+  profiles.
+- **Chris (Local Inference Lab Discord)** — the chat template fix, the
+  `chat_protocol.py` thinking-normalization patch (adopted here and extended
+  to the top-level `thinking` field), the core update advisory (PR#546 —
+  verified already carried by our engine core), and serving recipe advice
+  (evaluated per-piece; the thinking fixes and template were adopted, the
+  mixed-quant-only knobs were not applicable to uniform K4).
+- **lovesenko** — the abliterated checkpoint
+  ([GLM-5.3-Flash-tr3-4bpw-Abliterated](https://huggingface.co/lovesenko/GLM-5.3-Flash-tr3-4bpw-Abliterated)).
+- **local-inference-lab/vllm** — the upstream engine core this fork ports.
+- **turboderp** — EXL3. **IncoAI** — DFlash2. The upstream vLLM project.
+
+## Differences from upstream (brandonmmusic-max)
+
+- Engine core replaced with the upstream port (upstream still ships v84's).
+- ~90 additional bug fixes (upstream has none of these).
+- The thinking-disable fix (upstream's v84 ignores these controls).
+- Abliterated checkpoint support documented (upstream ships censored only).
+- New measured datasheet (upstream's numbers are pre-port, prefix-cache-off,
+  DFlash2-based; not comparable).
+
+## Known limitations
+
+- The crash fix family is verified by the deterministic repro + 5-round soak
+  and 150k-retrieval, not by multi-day soak; upstream's v85 image (requested
+  in [issue #3](https://github.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw/issues/3))
+  remains the long-term cure.
+- `_flashkda_C.abi3.so` is not shipped in this fork (dormant in production —
+  see README-PATCHES.md exclusions).
+- Prefix-cache reuse is weak (1.04–1.7x on repeats) — under investigation;
+  shared prefixes below ~7.8k tokens get no reuse (structural: 7,808-token
+  cache blocks).
+- Mixed-K3/K4 recipes (satgeze) are NOT covered; this fork is uniform-K4 only.
+
+## Provenance
+
+The image embeds provenance labels (`local-inference.upstream-core-port.*`)
+and an in-image self-check compiling all 91 overlay mappings. Base image:
+`verdictai/glm53-flash-exl3-k4:r19-sm120-tp2-ep2-dcp2-v84-dflash2@sha256:0f1cdcc8...`
+(digest-pinned, unchanged from upstream). This checkpoint is distributed
+under the ShapleyMCG License 1.0 in [LICENSE](LICENSE). Transparent
+provenance only: no telemetry, callbacks, or inference modification.
