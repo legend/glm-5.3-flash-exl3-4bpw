@@ -197,7 +197,7 @@ def fused_recurrent_kda_fwd_kernel(
     if IS_SPEC_DECODING:
         initial_token = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
     else:
-        initial_token = 0
+        initial_token = tl.full((), 0, tl.int64)
     # [APC-Xid31/43 fix] The initial-state load reads the same num_spec+1
     # column grid as the loop below; an overlong spec row's accepted count
     # must be clamped to it exactly like the loop length.

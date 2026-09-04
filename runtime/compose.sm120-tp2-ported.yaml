@@ -156,7 +156,7 @@ services:
       - --max-num-batched-tokens
       - "2048"
       - --max-num-seqs
-      - "8"
+      - "16"
       - --gpu-memory-utilization
       - "0.987"
       - --enable-chunked-prefill

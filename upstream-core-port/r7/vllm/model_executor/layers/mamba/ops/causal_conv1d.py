@@ -887,7 +887,7 @@ def _causal_conv1d_update_kernel(
         )
         conv_state_token_offset = tl.maximum(conv_state_token_offset, 0)
     else:
-        conv_state_token_offset = 0
+        conv_state_token_offset = tl.full((), 0, tl.int64)
 
     # STEP 1: READ init_state data
     conv_states_base = (
