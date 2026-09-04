@@ -1,0 +1,131 @@
+# Patch Set — `upstream-core-port/` (release r1)
+
+This fork carries the complete production patch set that the base image
+(v84 runtime) does **not** include: an upstream engine-core port plus a family
+of root-cause GPU fault and correctness fixes, differential-debugged against
+the v84 runtime as the oracle. Everything lives in [`upstream-core-port/`](upstream-core-port/)
+and is shipped as a plain file overlay — the Dockerfile for this fork `COPY`s it
+over the same two trees the production compose bind-mounts into.
+
+- **Base image (digest-pinned):** `verdictai/glm53-flash-exl3-k4:r19-sm120-tp2-ep2-dcp2-v84-dflash2@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692`
+- **Base vLLM lineage:** the `infernal-invocation` vLLM fork, PR-head `5f8e00d6c3` of [`local-inference-lab/vllm`](https://github.com/local-inference-lab/vllm)
+- **This overlay:** upstream PR-head engine core (the "r7 composition") + fork-compat
+  bridges, ported **onto** the v84 model-side files
+- **Provenance label in the patched image:** `local-inference.upstream-core-port.release=r1`
+
+## Overlay layout
+
+Each subdirectory is one port/fix wave; files keep their package-relative paths
+so the whole tree can be copied straight over the vLLM package in the image.
+[`upstream-core-port/MANIFEST.txt`](upstream-core-port/MANIFEST.txt) lists every
+file with its exact in-image destination.
+
+| Directory | Files | Contents | In-image target |
+|---|---|---|---|
+| `upstream-g1/vllm/` | 24 | scheduler, KV-cache utils/manager/coordinator/interface/pool, platforms, metrics, multimodal, model-executor interfaces | `/opt/infernal-invocation/vllm/vllm/` |
+| `upstream-g2/vllm/` | 45 | worker chain: buffers, block tables, mamba hybrid state, cudagraph utils, speculators, rejection sampler, sampling, MLA attention layer, attention ops (DCP/PCP) | `/opt/infernal-invocation/vllm/vllm/` |
+| `upstream-g3/vllm/` | 2 | `gpu/model_runner.py` (V2) + `gpu_model_runner.py` (V1) | `/opt/infernal-invocation/vllm/vllm/` |
+| `upstream-g4/vllm/` | 7 | indexer, compressor utils, sparse kpool indexer, attention-backend utils, KV layout, deep_gemm, `config/cache.py` | `/opt/infernal-invocation/vllm/vllm/` (cache.py also into the venv's installed `vllm/config/`) |
+| `r7/vllm/` | 9 | KEEP model-side files: glm5next `model.py`/`kda.py`, `kimi_gdn_linear_attn.py`, `abstract.py`, `gdn_attn.py`, `b12x.py`, `warmup.py`, `fused_recurrent.py`, `causal_conv1d.py` | `/opt/infernal-invocation/vllm/vllm/` |
+| `r7-b12x/b12x/` | 2 | `attention/_shared/mla/{kernel.py, prefill.py}` — record-walk stride fix + storage validation gates | `/opt/infernal-invocation/b12x/b12x/` |
+| `engine-core/` | 1 | `core.py` — the fork engine core with the prefill-throttle patch | `/opt/infernal-invocation/vllm/vllm/v1/engine/core.py` |
+
+The production compose (`compose.sm120-tp2-ported.yaml` in this repo) mirrors
+the bind-mount list these files were extracted from, for anyone who prefers the
+overlay-mount style over the baked image.
+
+## Patch history
+
+### 1. Upstream core port (~85 files, ~60 fork-compat bridges)
+
+The v84 runtime kept the model side (attention, MoE, speculators' kernels) but
+ran a stale engine core. We ported the upstream engine core from the
+PR-head lineage of `local-inference-lab/vllm` onto the v84 model-side files:
+scheduler, KV-cache pool/manager/coordinator/interface, model runners
+(V1 + V2), the full worker chain, and the speculator/rejection-sampler stack.
+Bridging the two trees required ~60 fork-compat bridges — config attribute
+differences, constructor signatures, `customize_spec` guards, profiling hooks,
+encoder-manager wiring, grammar kwargs, and friends. This is the
+`upstream-g1..g4` + `engine-core` portion of the overlay.
+
+### 2. Sparse-MLA layer-view aliasing — the root-cause fix
+
+The marquee bug. The ported per-bucket KV view emission gave the 12 sparse-MLA
+layers views only one page (2.25 MB) apart, while each view claimed the full
+310 MB pool — so every token past 7,808 silently read **another layer's KV**.
+Symptoms: short answers correct, long contexts garbage, plus Xid 31 / Xid 43
+GPU faults at the wild access.
+
+Fix: layer-contiguous bucket emission — per-layer regions `num_blocks × P`
+apart with extents that tile exactly — together with a collision-freeness
+proof. The mamba/KpoolTail parasitic pairing was re-derived with byte-equal
+twin proofs, and `KVBlockZeroer` per-layer coverage was fixed to match.
+
+### 3. B12X kernel record-walk fix
+
+The decode/prefill MG kernels derived the KV record stride from caller scalars
+(a scratch-plan `page_size` × a format constant) instead of the emitted
+per-layer view strides — a manager-level scalar could silently replace the
+kernel-page pair (64/18432). The kernels are now view-faithful: stride comes
+from `view.stride(0)`, page-block-size from `view.shape[1]`, with warmup guards.
+Added storage-extent validation behind the `VLLM_B12X_STORAGE_CHECK` env gate
+(`r7-b12x/b12x/attention/_shared/mla/`).
+
+### 4. H2D lifetime fixes (~20 sites across 6 files)
+
+Pinned host temporaries were dying at scope exit while `non_blocking` DMAs
+were still in flight — torn metadata (the smoking gun: `idx_mapping` arriving
+as a host-pointer fragment, proven at the value level). Fixes: synchronous
+staging for KB-scale metadata, CUDA-event-held in-flight lists for large
+transfers — `async_copy_to_gpu`, `async_tensor_h2d`, `CpuGpuBuffer.copy_to_uva`,
+UVA pool recycle events, MLA chunk metadata (7 sites), and conv metadata.
+
+### 5. Indexer fixes
+
+The port had dropped the v84 write-path block-table translation (translated
+table, factor 2, DCP remap, compressor DCP params, dcp-shard-count init), which
+scrambled every kpool K write in-bounds — restored. Per-chunk `.item()` device
+syncs were removed (2 per chunk) — the port now beats v84 on this path. Plus
+the APC page-guard and a 4× right-sizing of the prefill buffers
+(1321 MB → 132 MB per lane).
+
+### 6. Gather bounds clamps
+
+Logprobs UVA token-id reads, vocab gathers, and the drafter embedding gather
+are now clamped (vocab clamp at the `_run_model` chokepoint), so torn metadata
+degrades to a valid lookup instead of an out-of-bounds access / Xid.
+
+### 7. Rejection-sampler padding mask (port bug)
+
+The port dropped v84's `masked_fill` on verification rows, letting garbage
+positive padded rows get "verified" — restored.
+
+### 8. Perf / parity
+
+v84-default cudagraph capture sizes (up to 64, including 24), scheduler
+probe-gating (import/os.environ hoisted out of the hot loop), and all hunt
+probes converted to env/marker-gated with zero cost when off.
+
+## Measured outcomes
+
+- A deterministic crash repro — warm 400k cache + 2×140k concurrent sessions
+  that killed every pre-fix configuration in ≤ 90 s — now passes a clean
+  5-round soak.
+- 150k-token exact mid-document retrieval is correct.
+- CC1 throughput: 147–157 tok/s (cudagraphs on, MTP-3).
+- TTFT 8.4 s @ 33k context / 25.6 s @ 100k context (~4,700 tok/s prefill).
+
+## What is *not* shipped here
+
+- `_flashkda_C.abi3.so` (dormant ~4 MB extension binary) — not needed by the
+  current code paths; deliberately left out of the public fork.
+- Development/diagnostic harnesses, `__pycache__`, and port-time test scripts
+  (`import_test.py`, `test_*.py`, run scripts) — excluded from the overlay.
+- The `.diffbak-*` / backup composition trees (`r7-pooled` and friends) —
+  intermediate work, not part of the live mount set.
+
+## Credits
+
+- **Upstream engine core:** [local-inference-lab/vllm](https://github.com/local-inference-lab/vllm) (PR-head lineage `5f8e00d6c3`)
+- **Original v84 runtime:** brandonmmusic-max (the `verdictai/glm53-flash-exl3-k4:r19-...-v84-dflash2` image this fork builds on)
+- **FlashKDA / vllm-project** — KDA attention kernels used by the model side
