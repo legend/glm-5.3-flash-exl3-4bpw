@@ -1,0 +1,187 @@
+# GLM-5.3-Flash TR3 4bpw — v84 runtime + upstream-core-port r1 (fork build).
+# Image: this repo's Dockerfile (digest-pinned v84 base + overlay COPYs +
+# in-image compile self-check). Build with ./build.sh — no bind mounts needed.
+# This compose is for overlay-style users who prefer the files live-mountable
+# from the repo tree: the volume list below is the production compose's
+# mount list (compose.sm120-tp2-ablit.yaml), remapped from the production
+# apc-overlay tree to ./upstream-core-port/ (identical content — the image
+# already carries the same files baked in).
+# _flashkda_C.abi3.so is NOT mounted: not shipped in this fork (dormant
+# binary; see README-PATCHES.md). Env/command identical to production
+# (MTP3, B12X_MLA_SPARSE, nvfp4_ds_mla, prefix caching ON, --max-model-len
+# 262144, v84-default cudagraph sizes).
+
+services:
+  glm53-flash:
+    image: legend/glm53-flash-exl3-k4:r1-upstream-core-port
+    container_name: glm53-flash-exl3-k4-ported
+    init: true
+    ipc: host
+    shm_size: 32gb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GLM53_PORT:-8012}:${GLM53_PORT:-8012}"
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_DEBUG_KDA_INPUTS: "0"
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      VLLM_USE_B12X_DCP_A2A: "1"
+      OMP_NUM_THREADS: "2"
+      NCCL_P2P_LEVEL: "4"
+    volumes:
+      - ${GLM53_MODEL_PATH:?set GLM53_MODEL_PATH to the EXL3 checkpoint}:/model:ro
+      - ${GLM53_CACHE_PATH:-./glm53-vllm-cache}:/cache
+      - ./upstream-core-port/engine-core/core.py:/opt/infernal-invocation/vllm/vllm/v1/engine/core.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/platforms/interface.py:/opt/infernal-invocation/vllm/vllm/platforms/interface.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/utils/torch_utils.py:/opt/infernal-invocation/vllm/vllm/utils/torch_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/utils.py:/opt/infernal-invocation/vllm/vllm/v1/utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/sample/prompt_logprob.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/sample/prompt_logprob.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/sample/logprob.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/sample/logprob.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/models/interfaces.py:/opt/infernal-invocation/vllm/vllm/model_executor/models/interfaces.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/models/utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/models/utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/multimodal/inputs.py:/opt/infernal-invocation/vllm/vllm/multimodal/inputs.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/layers/fused_moe/utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/fused_moe/utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/layers/quantization/utils/config_utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/quantization/utils/config_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/layers/quantization/utils/layer_utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/quantization/utils/layer_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/layers/quantization/utils/mxfp4_utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/quantization/utils/mxfp4_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/layers/quantization/utils/mxfp6_utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/quantization/utils/mxfp6_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/layers/quantization/utils/mxfp8_utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/quantization/utils/mxfp8_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/model_executor/models/deepseek_v2.py:/opt/infernal-invocation/vllm/vllm/model_executor/models/deepseek_v2.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/multimodal/utils.py:/opt/infernal-invocation/vllm/vllm/multimodal/utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/kv_cache_interface.py:/opt/infernal-invocation/vllm/vllm/v1/kv_cache_interface.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/spec_decode/dynamic/acceptance_length.py:/opt/infernal-invocation/vllm/vllm/v1/spec_decode/dynamic/acceptance_length.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/block_pool.py:/opt/infernal-invocation/vllm/vllm/v1/core/block_pool.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/kv_cache_coordinator.py:/opt/infernal-invocation/vllm/vllm/v1/core/kv_cache_coordinator.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/kv_cache_manager.py:/opt/infernal-invocation/vllm/vllm/v1/core/kv_cache_manager.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/kv_cache_utils.py:/opt/infernal-invocation/vllm/vllm/v1/core/kv_cache_utils.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/single_type_kv_cache_manager.py:/opt/infernal-invocation/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/sched/output.py:/opt/infernal-invocation/vllm/vllm/v1/core/sched/output.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/core/sched/scheduler.py:/opt/infernal-invocation/vllm/vllm/v1/core/sched/scheduler.py:ro
+      - ./upstream-core-port/upstream-g1/vllm/v1/metrics/stats.py:/opt/infernal-invocation/vllm/vllm/v1/metrics/stats.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention_layer_base.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention_layer_base.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/dp_utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/dp_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/mamba/mamba_utils.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/mamba/mamba_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/hpc/__init__.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/hpc/__init__.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/hpc/hpc_module.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/hpc/hpc_module.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/hpc/rope_norm.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/hpc/rope_norm.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/__init__.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/__init__.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/chunked_local_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/chunked_local_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/cross_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/cross_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/encoder_only_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/encoder_only_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/mla_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/mla_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/mm_encoder_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/mm_encoder_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/prefill_prefix_lm_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/prefill_prefix_lm_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/rswa_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/rswa_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/layers/attention/static_sink_attention.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/attention/static_sink_attention.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/warmup/jit_warmup.py:/opt/infernal-invocation/vllm/vllm/model_executor/warmup/jit_warmup.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/model_executor/warmup/jit_warmup_triton_helper.py:/opt/infernal-invocation/vllm/vllm/model_executor/warmup/jit_warmup_triton_helper.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/kv_cache_spec_registry.py:/opt/infernal-invocation/vllm/vllm/v1/kv_cache_spec_registry.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/outputs.py:/opt/infernal-invocation/vllm/vllm/v1/outputs.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/block_table.py:/opt/infernal-invocation/vllm/vllm/v1/worker/block_table.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/mamba_utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/mamba_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/workspace.py:/opt/infernal-invocation/vllm/vllm/v1/worker/workspace.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/async_utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/async_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/attn_utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/attn_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/block_table.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/block_table.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/buffer_utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/buffer_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/cudagraph_utils.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/cudagraph_utils.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/input_batch.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/input_batch.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/spec_decode/speculator.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/spec_decode/speculator.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/sample/batch_shard.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/sample/batch_shard.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/sample/output.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/sample/output.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/model_states/mamba_hybrid.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/model_states/mamba_hybrid.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/worker/gpu/model_states/recoverssm.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/model_states/recoverssm.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/attention/backends/hpc_attn.py:/opt/infernal-invocation/vllm/vllm/v1/attention/backends/hpc_attn.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/attention/backends/recoverssm_metadata.py:/opt/infernal-invocation/vllm/vllm/v1/attention/backends/recoverssm_metadata.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/attention/ops/cp_common.py:/opt/infernal-invocation/vllm/vllm/v1/attention/ops/cp_common.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/attention/ops/dcp.py:/opt/infernal-invocation/vllm/vllm/v1/attention/ops/dcp.py:ro
+      - ./upstream-core-port/upstream-g2/vllm/v1/attention/ops/pcp.py:/opt/infernal-invocation/vllm/vllm/v1/attention/ops/pcp.py:ro
+      - ./upstream-core-port/upstream-g3/vllm/v1/worker/gpu_model_runner.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu_model_runner.py:ro
+      - ./upstream-core-port/upstream-g3/vllm/v1/worker/gpu/model_runner.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/model_runner.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/utils/deep_gemm.py:/opt/infernal-invocation/vllm/vllm/utils/deep_gemm.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/v1/kv_cache_layout.py:/opt/infernal-invocation/vllm/vllm/v1/kv_cache_layout.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/v1/attention/backends/utils.py:/opt/infernal-invocation/vllm/vllm/v1/attention/backends/utils.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/v1/attention/backends/mla/compressor_utils.py:/opt/infernal-invocation/vllm/vllm/v1/attention/backends/mla/compressor_utils.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/v1/attention/backends/mla/indexer.py:/opt/infernal-invocation/vllm/vllm/v1/attention/backends/mla/indexer.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/config/cache.py:/opt/infernal-invocation/vllm/vllm/config/cache.py:ro
+      - ./upstream-core-port/r7/vllm/models/glm5next/nvidia/model.py:/opt/infernal-invocation/vllm/vllm/models/glm5next/nvidia/model.py:ro
+      - ./upstream-core-port/r7/vllm/models/glm5next/nvidia/kda.py:/opt/infernal-invocation/vllm/vllm/models/glm5next/nvidia/kda.py:ro
+      - ./upstream-core-port/r7/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:ro
+      - ./upstream-core-port/r7/vllm/model_executor/layers/mamba/abstract.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/mamba/abstract.py:ro
+      - ./upstream-core-port/r7/vllm/v1/attention/backends/gdn_attn.py:/opt/infernal-invocation/vllm/vllm/v1/attention/backends/gdn_attn.py:ro
+      - ./upstream-core-port/r7/vllm/utils/b12x.py:/opt/infernal-invocation/vllm/vllm/utils/b12x.py:ro
+      - ./upstream-core-port/r7/vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py:/opt/infernal-invocation/vllm/vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py:ro
+      - ./upstream-core-port/r7/vllm/model_executor/layers/mamba/ops/causal_conv1d.py:/opt/infernal-invocation/vllm/vllm/model_executor/layers/mamba/ops/causal_conv1d.py:ro
+      - ./upstream-core-port/r7/vllm/v1/worker/gpu/warmup.py:/opt/infernal-invocation/vllm/vllm/v1/worker/gpu/warmup.py:ro
+      - ./upstream-core-port/upstream-g4/vllm/config/cache.py:/opt/venv/lib/python3.12/site-packages/vllm/config/cache.py:ro
+      - ./upstream-core-port/r7-b12x/b12x/attention/_shared/mla/kernel.py:/opt/infernal-invocation/b12x/b12x/attention/_shared/mla/kernel.py:ro
+      - ./upstream-core-port/r7-b12x/b12x/attention/_shared/mla/prefill.py:/opt/infernal-invocation/b12x/b12x/attention/_shared/mla/prefill.py:ro
+    command:
+      - serve
+      - /model
+      - --served-model-name
+      - GLM-5.3-Flash-EXL3-4bpw
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${GLM53_PORT:-8012}"
+      - --tensor-parallel-size
+      - "2"
+      - --enable-expert-parallel
+      - --decode-context-parallel-size
+      - "2"
+      - --disable-custom-all-reduce
+      - --dcp-comm-backend
+      - a2a
+      - --dtype
+      - bfloat16
+      - --load-format
+      - safetensors
+      - --moe-backend
+      - b12x
+      - --attention-backend
+      - B12X_MLA_SPARSE
+      - --kv-cache-dtype
+      - nvfp4_ds_mla
+      - --max-model-len
+      - "262144"
+      - --max-num-batched-tokens
+      - "2048"
+      - --max-num-seqs
+      - "8"
+      - --gpu-memory-utilization
+      - "0.987"
+      - --enable-chunked-prefill
+      - --enable-prefix-caching
+      - --generation-config
+      - /model
+      - --chat-template
+      - /opt/glm53/chat_template.multimodal.jinja
+      - --reasoning-parser
+      - glm45
+      - --tool-call-parser
+      - glm47
+      - --enable-auto-tool-choice
+      - --prefill-schedule-interval
+      - "8"
+      - --kda-prefill-backend
+      - triton
+      - --compilation-config
+      - '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]}'
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GLM53_GPU_0:-0}", "${GLM53_GPU_1:-1}"]
+              capabilities: [gpu]
