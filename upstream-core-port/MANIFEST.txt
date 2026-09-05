@@ -92,5 +92,5 @@ upstream-g4/vllm/v1/attention/backends/mla/compressor_utils.py -> /opt/infernal-
 upstream-g4/vllm/v1/attention/backends/mla/indexer.py -> /opt/infernal-invocation/vllm/vllm/v1/attention/backends/mla/indexer.py
 upstream-g4/vllm/v1/attention/backends/utils.py -> /opt/infernal-invocation/vllm/vllm/v1/attention/backends/utils.py
 upstream-g4/vllm/v1/kv_cache_layout.py -> /opt/infernal-invocation/vllm/vllm/v1/kv_cache_layout.py
-upstream-core-port/chat/protocol.py|/opt/infernal-invocation/vllm/vllm/entrypoints/openai/chat_completion/protocol.py
-upstream-core-port/chat/chat_template.multimodal.jinja|/opt/glm53/chat_template.multimodal.jinja
+chat/protocol.py -> /opt/infernal-invocation/vllm/vllm/entrypoints/openai/chat_completion/protocol.py
+chat/chat_template.multimodal.jinja -> /opt/glm53/chat_template.multimodal.jinja

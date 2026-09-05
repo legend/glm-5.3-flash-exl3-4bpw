@@ -47,7 +47,11 @@ COPY upstream-core-port/upstream-g4/vllm/config/cache.py /opt/venv/lib/python3.1
 # --- fork engine core (prefill-throttle) over vllm/v1/engine/core.py ---
 COPY upstream-core-port/engine-core/core.py /opt/infernal-invocation/vllm/vllm/v1/engine/core.py
 
-# --- manifest: overlay file -> in-image destination (91 mappings / 90 files) ---
+# --- chat fixes: thinking-disable protocol patch + fixed chat template ---
+COPY upstream-core-port/chat/protocol.py /opt/infernal-invocation/vllm/vllm/entrypoints/openai/chat_completion/protocol.py
+COPY upstream-core-port/chat/chat_template.multimodal.jinja /opt/glm53/chat_template.multimodal.jinja
+
+# --- manifest: overlay file -> in-image destination (93 mappings / 92 files) ---
 COPY upstream-core-port/MANIFEST.txt /opt/glm53/upstream-core-port-MANIFEST.txt
 
 # Self-check, same pattern as the base image's provenance RUN: every mapped
@@ -64,9 +68,10 @@ for line in manifest.read_text().splitlines():
     src, dst = (part.strip() for part in line.split("->", 1))
     path = Path(dst)
     assert path.is_file(), f"missing overlay destination: {dst} (from {src})"
-    # in-memory byte-compile: parses the file without touching __pycache__
-    compile(path.read_bytes(), str(path), "exec")
+    # in-memory byte-compile .py files only (the chat template is jinja)
+    if path.suffix == ".py":
+        compile(path.read_bytes(), str(path), "exec")
     n += 1
-assert n == 91, f"expected 91 overlay mappings, compiled {n}"
+assert n == 93, f"expected 93 overlay mappings, compiled {n}"
 print(f"UPSTREAM-CORE-PORT R1 SELF-CHECK PASSED ({n}/{n} overlay mappings compile)")
 PY

@@ -24,7 +24,7 @@ maps = [l for l in manifest if l.strip() and not l.strip().startswith("#") and "
 for line in maps:
     src, dst = (p.strip() for p in line.split("->", 1))
     assert (root / src).is_file(), f"MANIFEST maps missing source: {src}"
-assert len(maps) == 91, f"expected 91 manifest mappings, found {len(maps)}"
+assert len(maps) == 93, f"expected 93 manifest mappings, found {len(maps)}"
 
 print(f"OVERLAY COMPILE-CHECK PASSED ({len(files)} files, {len(maps)} mappings)")
 PY

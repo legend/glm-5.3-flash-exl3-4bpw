@@ -183,9 +183,11 @@ For each function call, output the function name and arguments within the follow
         {%- set ns_chk.can_sort = false -%}
     {%- else -%}
         {%- for k in range(block_start, ns_blk.end + 1) -%}
+            {%- if not ns_chk.can_sort -%}{%- break -%}{%- endif -%}
             {%- set m = messages[k] -%}
             {%- if is_list_of_outputs(m) -%}
                 {%- for entry in m.content -%}
+                    {%- if not ns_chk.can_sort -%}{%- break -%}{%- endif -%}
                     {%- set eid = id_of(entry) -%}
                     {%- if not eid -%}
                         {%- set ns_chk.can_sort = false -%}
