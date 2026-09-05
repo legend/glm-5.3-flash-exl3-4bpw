@@ -612,8 +612,14 @@ class EngineCore:
         engine too, using the same cadence logic as the DP override: skip
         prefill chunks on non-cadence steps so active decodes fill them alone
         (decouples decode ITL from the inflight chunk's wall-clock). Set
-        --prefill-schedule-interval > 1 to enable; anti-starvation is guarded
-        by Scheduler.prefill_capacity_bound."""
+        --prefill-schedule-interval > 1 to enable. OPT (opt/investigation):
+        anti-starvation no longer depends on the scheduler-side
+        prefill_capacity_bound release (removed — it disarmed the throttle
+        under continuous load); chunks admit on every cadence window, so
+        prefill progress is bounded by interval, not eliminated."""
+        # OPT (opt/investigation, scheduler area): keep cadence check; the
+        # scheduler-side waiting-queue release that disarmed this throttle
+        # under continuous load was removed (Scheduler.prefill_capacity_bound).
         return (
             self.prefill_schedule_interval > 1
             and self.step_counter % self.prefill_schedule_interval != 0
@@ -2157,6 +2163,9 @@ class DPEngineCoreProc(EngineCoreProc):
         # Throttle new prefills to cadence-aligned steps for DP balancing.
         # step_counter is identical across DP ranks. On a fresh wave the
         # counter is 0, so prefills are admitted immediately after idle.
+        # OPT (opt/investigation, scheduler area): keep cadence check; the
+        # scheduler-side waiting-queue release that disarmed this throttle
+        # under continuous load was removed (Scheduler.prefill_capacity_bound).
         return (
             self.prefill_schedule_interval > 1
             and self.step_counter % self.prefill_schedule_interval != 0

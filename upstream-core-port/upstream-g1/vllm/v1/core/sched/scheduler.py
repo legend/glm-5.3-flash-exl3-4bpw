@@ -349,10 +349,6 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
-        # DP prefill balancing: Flag to track whether the last cadence-aligned
-        # prefill batch fully drained the waiting queue. Prefill throttling
-        # is disabled in this case.
-        self.prefill_capacity_bound = False
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -628,11 +624,18 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # OPT (opt/investigation, scheduler area): prefill throttle release.
+        # The stock release (prefill_capacity_bound = bool(self.waiting)) latches
+        # True whenever the waiting queue is non-empty, which under continuous
+        # submission (usr5-style) disarms --prefill-schedule-interval entirely:
+        # a 2048-token chunk then runs in ~every window (~419 ms at 100k ctx)
+        # and decode collapses to ~5 tok/s/req. Release the throttle only when
+        # interleaving is actually pointless: no decode requests are in flight.
+        # Chunks still admit on every cadence window, so prefills cannot starve.
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+            throttle_prefills
+            and any(not r.is_prefill_chunk for r in self.running)
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1279,10 +1282,9 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
-            # DP prefill balancing: on a step that admitted prefills (release),
-            # record whether it was capacity-bound.
-            if not defer_prefills:
-                self.prefill_capacity_bound = bool(self.waiting)
+            # OPT (opt/investigation, scheduler area): capacity-bound tracking
+            # removed with the release gate (see defer_prefills above); the
+            # waiting queue no longer disarms the prefill cadence.
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

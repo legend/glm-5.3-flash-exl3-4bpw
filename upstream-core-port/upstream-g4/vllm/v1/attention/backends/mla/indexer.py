@@ -1342,7 +1342,24 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and self.kv_cache_spec.block_size % kbs == 0
             ):
                 factor = self.kv_cache_spec.block_size // kbs
-                indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+                # [PERF 2026-09-04] Persistent buffer instead of a fresh
+                # .contiguous() allocation on every build() (every decode
+                # step + prefill chunk). The translated table is consumed
+                # within the step, so buffer reuse is safe; the decode side
+                # already uses the identical pattern
+                # (indexer_decode_block_table_buffer, indexer.py:1582).
+                translated = block_table[:, ::factor] // factor
+                rows, cols = translated.shape
+                buf = getattr(self, "indexer_block_table_buffer", None)
+                if buf is None or buf.shape[1] < cols:
+                    buf = torch.zeros(
+                        (self._max_num_batched_tokens, cols),
+                        dtype=translated.dtype,
+                        device=self.device,
+                    )
+                    self.indexer_block_table_buffer = buf
+                buf[:rows, :cols].copy_(translated)
+                indexer_block_table = buf[:rows, :cols]
             # [APC guard] host-side validation of the page table before any
             # kernel consumes it (see _validate_indexer_pages).
             indexer_block_table = self._validate_indexer_pages(

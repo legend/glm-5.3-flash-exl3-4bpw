@@ -1688,7 +1688,22 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if not apply_admission_cap:
                 self._num_checkpoint_blocks[request_id] = checkpoint_block
-            if num_new_blocks > 0:
+            if apply_admission_cap:
+                # Full-sequence admission gate (allocate_slots
+                # full_sequence_must_fit): report the real requirement for the
+                # whole sequence. The incremental trickle below collapses the
+                # count to ~1-3 blocks, so the gate under-counts align-mode
+                # requests by cdiv(prompt, block_size) - ~3 blocks (~10 slots
+                # for a 100k prompt), over-admits until the pool exhausts, and
+                # running requests end up preempted and re-prefilled.
+                num_new_blocks = (
+                    max(num_new_blocks, 1)
+                    + int(has_partial_hit)
+                    + checkpoint_block
+                )
+                if request_id not in self._allocated_block_reqs:
+                    num_new_blocks += self.num_speculative_blocks
+            elif num_new_blocks > 0:
                 num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if request_id not in self._allocated_block_reqs:
                     num_new_blocks += self.num_speculative_blocks

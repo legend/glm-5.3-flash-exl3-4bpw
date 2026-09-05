@@ -129,3 +129,33 @@ probes converted to env/marker-gated with zero cost when off.
 - **Upstream engine core:** [local-inference-lab/vllm](https://github.com/local-inference-lab/vllm) (PR-head lineage `5f8e00d6c3`)
 - **Original v84 runtime:** brandonmmusic-max (the `verdictai/glm53-flash-exl3-k4:r19-...-v84-dflash2` image this fork builds on)
 - **FlashKDA / vllm-project** — KDA attention kernels used by the model side
+
+## Release r1.1 — performance batch (2026-09-05, peer-reviewed)
+
+Applied on top of r1, from a 6-area optimization sweep with 3-agent peer review:
+
+- **Scheduler Fix A**: `prefill_capacity_bound` latched to `bool(self.waiting)` on every
+  non-deferred step, disarming `--prefill-schedule-interval` entirely under continuous
+  submission (a 2048-token chunk ran in ~every window). The latch is removed; decode
+  windows are guaranteed between prefill chunks.
+- **kvcache 0001**: a non-participating KpoolTailManager vetoed partial hash hits for the
+  whole engine, collapsing prefix-reuse granularity to 15,616 tokens (7808 × DCP2) — every
+  sub-15k shared prefix got 0% cache hits. The veto now only counts participating groups:
+  granularity back to 7,808.
+- **kvcache 0002**: the mamba-align admission gate under-counted blocks (~2 vs ~14 for a
+  100k no-hit request) → over-admission → measured 77 preemptions/3,467 requests. Honest count.
+- **attn 0002**: the indexer's prefill path allocated a fresh `.contiguous()` block-table
+  translation every step (2× per step, target + draft). Now a persistent buffer like the
+  decode path.
+- **Relay (tps-injector, separate repo)**: keepalive match (aiohttp 15s vs engine 5s caused
+  a 36% request-failure + re-prefill amplification loop), safe one-shot send-retry, GATE
+  journal-line removal, vision-image sizing without b64 decode.
+
+Measurement corrections from the decode-speed investigation (opt-work/bench/RESULTS.md):
+- vLLM streams one SSE chunk per MTP verify-step — chunk rates under-report tok/s by the
+  acceptance factor. True CC1 was never below ~114 tok/s; the "36-46 tok/s crisis" was a
+  chunk-counting artifact.
+- Acceptance is content-driven (creative prose ~1.8, code ~2.9, enumeration 3.4-4.4
+  tok/step); the historical 3.5-3.77 baseline was structured-content windows.
+- True tok/s matrix (production shape, max-num-seqs 16, MTP3): CC1 122-142, CC2 184,
+  CC4 253, CC8 339 (count-prompt CC8 aggregate 586).

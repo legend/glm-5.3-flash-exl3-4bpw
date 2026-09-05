@@ -652,8 +652,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
-                for manager in self.single_type_managers
-                if not manager.supports_fine_grained_hash_lookup
+                for manager, group in zip(
+                    self.single_type_managers,
+                    self.kv_cache_config.kv_cache_groups,
+                )
+                # Scratch groups that opted out of prefix caching (e.g. the
+                # GLM-5.3-Flash kpool tail) never serve cache hits, so they
+                # cannot constrain fine-grained hash lookups. Without this
+                # filter, KpoolTailManager vetoed partial hash hits for the
+                # whole engine, collapsing prefix-reuse granularity to
+                # scheduler_block_size (15616 tokens under DCP2) and putting
+                # every sub-15616-token shared prefix out of reach.
+                if group.kv_cache_spec.participates_in_prefix_caching
+                and not manager.supports_fine_grained_hash_lookup
                 and manager.block_size != hash_block_size
             }
             if unsupported_partial_hit_managers:
