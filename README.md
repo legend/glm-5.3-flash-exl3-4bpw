@@ -184,3 +184,41 @@ and an in-image self-check compiling all 91 overlay mappings. Base image:
 (digest-pinned, unchanged from upstream). This checkpoint is distributed
 under the ShapleyMCG License 1.0 in [LICENSE](LICENSE). Transparent
 provenance only: no telemetry, callbacks, or inference modification.
+
+## Release r2 — FP8 KV + throughput/cache fixes (2026-09-06)
+
+Everything below is on `main`, built into
+`legend/glm53-flash-exl3-k4:r2-upstream-core-port-fp8`
+(image `sha256:852dbfc3...`; the `r1-upstream-core-port` tag also points
+there — all self-checks pass in-image).
+
+### Headline: native FP8 KV cache
+`--kv-cache-dtype fp8_ds_mla` now works on B12X_MLA_SPARSE with the
+correct NoPE 528-byte record (512B e4m3 latent + 16B inline fp32 scales,
+no RoPE tail). Env-gated `VLLM_B12X_FP8_KV=1` (default off = bit-identical
+nvfp4). Benched A/B on 2x RTX PRO 6000 (TP2/EP2/DCP2, MTP3):
+- **Decode 2.8x nvfp4 at 16k-32k context, C8** (ITL p50 58 -> 31 ms),
+  parity at ctx 0, prefill ~5% slower
+- KV pool 1.25M tokens (vs 1.75M nvfp4) — quality-for-capacity trade
+- Estonia long-context task: PASS 8/8 on both dtypes, zero loops/truncations
+- Config portability: the scheduler block size is dtype-coupled — set
+  `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` 15,616 (nvfp4) / 17,920 (FP8)
+  (see `glm-tr3/ROLLBACK-NVFP4.md` in the llm-server repo for both flips)
+
+### Throughput & cache fixes (all live-verified)
+- **Scheduler Fix A** — the prefill-throttle latch that disarmed
+  `--prefill-schedule-interval` under continuous submission
+- **Fix B** — decode-aware 512-token prefill chunk cap: ITL p95 421 ms
+  -> 27 ms during concurrent 100k prefills, zero stalls >300 ms
+- **Cache-wipe fix** (`VLLM_MAMBA_STATE_PROTECT=16`) — admission reserve
+  that stops a concurrent whale's allocations from stripping a fresh
+  session's cached states (the "two sessions wipe each other" root cause;
+  churned-session hit rate ~20% -> 60-80%)
+- **Prefix retention** (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`) — mamba
+  boundary states survive request completion (15,616 = the nvfp4 max)
+- **kvcache 0001/0002** — prefix granularity 15,616 -> 7,808; honest
+  mamba admission counts (kills over-admission preemptions)
+- **attn 0002** — indexer persistent buffer (per-step alloc removed)
+- **int64 Triton branch fixes** — required for `--max-num-seqs 16`
+- **Fused draft-decode** (P1/F6) — complete, shadow-verified correct,
+  shipped gated-off (perf-neutral on this stack; documented)
