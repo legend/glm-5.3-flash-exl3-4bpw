@@ -159,3 +159,38 @@ Measurement corrections from the decode-speed investigation (opt-work/bench/RESU
   tok/step); the historical 3.5-3.77 baseline was structured-content windows.
 - True tok/s matrix (production shape, max-num-seqs 16, MTP3): CC1 122-142, CC2 184,
   CC4 253, CC8 339 (count-prompt CC8 aggregate 586).
+
+## Release r2 — FP8 KV + scheduler/cache fixes (2026-09-06)
+
+On top of r1.1, all peer-verified and benchmarked (llm-inference-bench A/B):
+
+- **Native FP8 KV cache (fp8_ds_mla, 528B NoPE records)** — full read path
+  (traits GLM_NOPE+ARBITRARY_FP32 incl. the infer_model_type 528-tie-break fix
+  over the old DSV4 mis-inference, io/io_mg staging, kernel record validation,
+  storage-check width parity, glm_nope_fp8 model version, width-authority
+  replaces the four hardcoded 656s, NoPE-aware mla_attention spec) + the
+  **Triton capture-safe 528-record writer** (torch path is CPU-reference only)
+  + the prefill-MG admission for GLM_NOPE+ARBITRARY_FP32 (d_rope=0 rope staging
+  is zero-iteration const_expr) + the DSL raise-in-const_expr fix (io_mg).
+  Env-gated: `VLLM_B12X_FP8_KV=1`, default off = bit-identical nvfp4.
+  Benched A/B: FP8 decode is 2.8x nvfp4 at 16k-32k/C8 (ITL p50 58->31ms),
+  parity at ctx 0; prefill ~5% slower; KV pool 1.25M vs 1.75M tokens.
+  Rollback/config portability: the scheduler block is dtype-coupled —
+  retention interval must be 15,616 (nvfp4) / 17,920 (FP8).
+- **Scheduler Fix A (throttle-latch)**: prefill_capacity_bound latched to
+  bool(waiting) disarmed --prefill-schedule-interval under continuous load.
+- **Fix B (decode-aware chunk cap)**: 512-token chunk budget when decodes run
+  (ITL p95 421ms -> 27ms under concurrent whale prefill, 0 stalls >300ms).
+- **kvcache 0001 (kpool veto)**: prefix granularity 15,616 -> 7,808.
+- **kvcache 0002 (honest mamba admission)**: kills over-admission preemptions.
+- **attn 0002 (indexer persistent buffer)**: per-step .contiguous() alloc gone.
+- **Cache-wipe fix (VLLM_MAMBA_STATE_PROTECT=16)**: admission reserve so a
+  concurrent whale's allocations cannot strip a fresh session's cached mamba/
+  MLA/draft entries (free-ring exhaustion, NOT capacity — the 2-sessions-wipe-
+  each-other root cause; hit rate ~20% -> 60-80% under churn).
+- **Int64 Triton branch fixes** (required for max-num-seqs 16).
+- **Fused draft-decode (P1/F6)**: complete + shadow-verified correct, shipped
+  gated-off (performance-neutral: the MTP overhead is draft GPU-forward, not
+  host metadata; enable via VLLM_FUSED_DRAFT_DECODE=1 if a case appears).
+- **Prefix retention (VLLM_PREFIX_CACHE_RETENTION_INTERVAL)**: mamba boundary
+  states survive request completion (15,616 legal max on nvfp4).

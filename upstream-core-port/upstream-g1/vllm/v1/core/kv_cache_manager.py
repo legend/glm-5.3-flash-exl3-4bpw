@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -132,6 +133,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        eagle_drop_exempt: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -143,6 +145,29 @@ class KVCacheManager:
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
+        # [MAMBA-STATE-PROTECT] Admission reserve, in pool blocks. When set,
+        # a request's FIRST allocation requires `demand + reserve` free
+        # blocks, so a freshly completed session's tail-resident cache
+        # entries (mamba align replay boundary, MLA prefix blocks, draft
+        # entries) are never the blocks a concurrently-admitted prefill must
+        # consume: in the shallow free-ring regime (concurrent whale
+        # sessions holding most of the pool) an intervening whale prefill
+        # otherwise walks the whole free ring front-to-tail and strips them,
+        # zeroing the next turn's reconciled prefix hit. The reserve applies
+        # to first allocations only — running requests' chunk/decode growth
+        # is exempt, so completion is never blocked and the ring always
+        # deepens (backpressure, not deadlock). 0/unset = off
+        # (bit-identical). Useful range ~8-24 blocks (one session's
+        # tail-resident entry count is ~8-11 under retention 15,616).
+        self.mamba_state_reserve = max(
+            0, int(os.environ.get("VLLM_MAMBA_STATE_PROTECT", "0") or 0)
+        )
+        if self.mamba_state_reserve:
+            logger.info(
+                "VLLM_MAMBA_STATE_PROTECT=%d: admission reserves %d free "
+                "blocks to protect freshly cached session states.",
+                self.mamba_state_reserve, self.mamba_state_reserve,
+            )
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
@@ -155,6 +180,7 @@ class KVCacheManager:
             max_model_len=self.max_model_len,
             max_in_flight_tokens=max_in_flight_tokens,
             use_eagle=self.use_eagle,
+            eagle_drop_exempt=eagle_drop_exempt,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
@@ -472,6 +498,14 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
+        is_first_allocation = not any(
+            m.req_to_blocks.get(request.request_id)
+            for m in self.coordinator.single_type_managers
+        )
+        state_reserve = (
+            self.mamba_state_reserve if is_first_allocation else 0
+        )
+
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -486,7 +520,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
+            required_blocks = (
+                num_blocks_to_allocate + watermark_blocks + state_reserve
+            )
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
@@ -521,10 +557,39 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
+        # [MAMBA-STATE-PROTECT] On a request's first allocation the
+        # incremental count undercounts a long prompt (the align trickle
+        # reports 1-3 blocks for what will hold cdiv(prompt, block) + spec +
+        # checkpoint). Gate the admission on the honest full-sequence
+        # requirement plus the reserve, or the guarantee is void exactly in
+        # the shallow-ring regime it exists for. Running requests are exempt
+        # (is_first_allocation false), so decode never stalls on the reserve
+        # and the ring always deepens.
+        if state_reserve:
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            honest_demand = self.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+            )
+            # Kpool/CoW/dec-recycle growth is not visible to the
+            # full-sequence count; the reserve also absorbs that gap.
+            required_blocks = (
+                max(num_blocks_to_allocate, honest_demand)
+                + watermark_blocks
+                + state_reserve
+            )
+        else:
+            required_blocks = num_blocks_to_allocate + watermark_blocks
+
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None

@@ -312,6 +312,17 @@ class Scheduler(SchedulerInterface):
                     num_spec_tokens_by_batch_size=self.dynamic_sd_lookup,
                 )
             self.use_eagle = speculative_config.use_eagle()
+            # [PREFIX-GAP Stage B 2026-09-05] DFlash draft attention state is
+            # independent of the target GDN recurrent state (same argument as
+            # mamba_has_prefill_checkpoint_blocks' carve-out, scheduler.py:378),
+            # so dflash does not need the one-block eagle backoff/drop that
+            # eagle/mtp do (the MTP draft tail is lookahead-dependent; dflash
+            # is not). Gated by VLLM_DFLASH_REPLAY_BOUNDARY=1; default off =
+            # bit-identical. See opt-work/prefix-gap/FINDINGS.md D2 Stage B.
+            self.dflash_replay_boundary = (
+                speculative_config.use_dflash()
+                and os.environ.get("VLLM_DFLASH_REPLAY_BOUNDARY", "0") == "1"
+            )
             if self.use_eagle:
                 self.num_prefill_lookahead = (
                     self.num_spec_tokens
@@ -330,6 +341,7 @@ class Scheduler(SchedulerInterface):
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
             num_prefill_lookahead=self.num_prefill_lookahead,
+            eagle_drop_exempt=getattr(self, "dflash_replay_boundary", False),
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -486,7 +498,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle and not self.dflash_replay_boundary:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -624,6 +636,26 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # OPT (opt/investigation, scheduler area): decode-aware prefill cap
+        # (Fix B, ported onto Fix A's throttle release). When any decode
+        # request is in flight, cap the prefill chunk budget so the chunk
+        # window (the dominant GPU cost at 100k ctx) shrinks instead of
+        # monopolizing the whole max_num_batched_tokens budget. At long
+        # context the chunk cost is ~linear in chunk length, so a 512-token
+        # cap cuts decode ITL ~4x for ~-9% prefill throughput. With no
+        # decodes in flight, chunks keep the full budget.
+        num_decode_reqs = sum(
+            not r.is_prefill_chunk for r in self.running
+        )
+        chunk_cap = (
+            self.max_num_scheduled_tokens
+            if num_decode_reqs == 0
+            else max(
+                self.max_num_scheduled_tokens // 4,
+                self.scheduler_config.max_num_seqs,
+            )
+        )
+
         # OPT (opt/investigation, scheduler area): prefill throttle release.
         # The stock release (prefill_capacity_bound = bool(self.waiting)) latches
         # True whenever the waiting queue is non-empty, which under continuous
@@ -677,6 +709,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.is_prefill_chunk:
+                # OPT: decode-aware prefill cap (see chunk_cap above).
+                num_new_tokens = min(num_new_tokens, chunk_cap)
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
@@ -1085,6 +1120,10 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
+                    if num_new_tokens > chunk_cap:
+                        # OPT: decode-aware prefill cap — admit the head request
+                        # as a chunk within the cap instead of the full budget.
+                        num_new_tokens = chunk_cap
                     assert num_new_tokens > 0
 
                     # Apply Mamba alignment before encoder caps.

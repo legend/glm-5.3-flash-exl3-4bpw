@@ -38,6 +38,10 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
+# GLM_NOPE FP8 record (fp8_ds_mla, the validated r7 528B ABI --
+# pooled_indexer.py:64; mirrors io.py/kernel.py _GLM_NOPE_GMEM_STRIDE and the
+# width authority; lockstep enforced by test_fp8_native.py).
+_GLM_NOPE_GMEM_STRIDE = 528
 
 
 def _cache_block_stride_bytes(
@@ -52,10 +56,18 @@ def _cache_block_stride_bytes(
     )
 
     if model_type in (ModelType.GLM_NSA, ModelType.GLM_NOPE):
-        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32), 432B
-        # or 368B (GLM_NSA NVFP4), 288B or 304B (GLM_NOPE NVFP4).
-        # ``record_bytes`` comes from traits.kv_gmem_stride.
-        rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
+        # GLM-family per-token contiguous record: 656B (GLM_NSA
+        # ARBITRARY_FP32), 432B or 368B (GLM_NSA NVFP4), 288B or 304B
+        # (GLM_NOPE NVFP4), 528B (GLM_NOPE FP8 / fp8_ds_mla).
+        # ``record_bytes`` comes from traits.kv_gmem_stride; the NoPE default
+        # is 528 -- the rope-bearing 656 must be unreachable for a rope-less
+        # model (R7 gap G6).
+        if record_bytes is not None:
+            rec = int(record_bytes)
+        elif model_type == ModelType.GLM_NOPE:
+            rec = _GLM_NOPE_GMEM_STRIDE
+        else:
+            rec = _GLM_KV_GMEM_STRIDE
         if cache.ndim >= 3:
             # GLM record walk: derive the per-block byte stride from the
             # per-layer VIEW the staged KV interface emits ([blocks, page,
@@ -294,6 +306,19 @@ def run_unified_prefill(
                 f"q_head_dim={q_head_dim}, inferred={int(inferred_scale_format)}, "
                 f"override={int(scale_format)}"
             )
+    if scale_format == ScaleFormat.ARBITRARY_FP32 and q_head_dim == _DSV4_HEAD_DIM:
+        # FP8 record-width validation (decode's ARBITRARY_FP32 arm, mirrored):
+        # a NoPE (GLM_NOPE) cache must be the 528-byte fp8_ds_mla record --
+        # 512B e4m3 latent + 16B inline fp32 scales, NO rope tail. The 656B
+        # default is the rope-bearing V3.2/NSA shape (R7 gap G5).
+        record_bytes = int(kv_cache.shape[-1])
+        if int(model_type) == int(ModelType.GLM_NOPE):
+            if record_bytes != _GLM_NOPE_GMEM_STRIDE:
+                raise ValueError(
+                    "GLM_NOPE FP8 cache record must be 528 bytes "
+                    "(512B e4m3 latent + 16B inline fp32 scales, no rope "
+                    f"tail); got {record_bytes}"
+                )
     # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
     # the NVFP4 fp8-rope 368-byte record ONLY (fp8_rope agreement is enforced
     # by make_unified_traits and the MG record-width validation).
@@ -353,7 +378,7 @@ def run_unified_prefill(
             extra_kv_cache, "sparse MLA prefill extra_kv_cache"
         )
 
-    if kv_cache.ndim >= 3 and int(kv_cache.shape[1]) in (32, 64):
+    if kv_cache.ndim >= 3 and int(kv_cache.shape[1]) in (32, 64, 256):
         # GLM record-walk page: the view's own tokens-per-block (the same
         # source as the stride derivation below), so the index decomposition
         # (block = idx // pbs, local = idx % pbs) and the per-block byte
@@ -467,16 +492,21 @@ def run_unified_prefill(
     #   optional 16-head tail -> MG_N_HG=1
     #   optional 8-head tail  -> MG_N_HG=1 + VALID_HPB=8
     # topk in {512,1024,2048}.
+    # [FP8-NATIVE 2026-09-06] GLM_NOPE (d_rope=0) joins the ARBITRARY_FP32 MG
+    # gate: the arm's rope staging is range_constexpr(d_rope // 16) -- zero
+    # iterations at d_rope=0, structurally safe -- and the traits pass the
+    # 528B nope+inline-fp32 record (512 e4m3 + 16B scales, rope stripped).
+    # Same admission shape as the NVFP4 family gate below.
     _mg_glm = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
+        and model_type in (ModelType.GLM_NSA, ModelType.GLM_NOPE)
         and scale_format == ScaleFormat.ARBITRARY_FP32
     )
     if _mg_glm and topk in (512, 1024, 2048):
         return _run_partitioned_mg(
             compute_mode=ComputeMode.FP8,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.ARBITRARY_FP32,
         )
     # ── NVFP4 (E2M1 + E4M3 group-16, GLM-family) MG gate ───────────────────────

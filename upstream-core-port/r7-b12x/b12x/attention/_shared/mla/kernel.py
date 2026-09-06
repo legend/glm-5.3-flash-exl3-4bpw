@@ -77,6 +77,14 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
+# GLM_NOPE FP8 record (fp8_ds_mla -- the validated r7 528B ABI,
+# pooled_indexer.py:64 _MLA_RECORD_BYTES=528; REFERENCE-VALIDATION.md §1.1):
+# the strict [0, 528) prefix of the 656B rope-bearing record -- 512B e4m3
+# latent + 16B inline fp32 scales -- NO rope tail (qk_rope_head_dim == 0).
+# Mirrors io.py _GLM_NOPE_GMEM_STRIDE and the width authority
+# (opt-work/fp8-native/staged/fp8_kv_record_abi.py); lockstep enforced by
+# test_fp8_native.py.
+_GLM_NOPE_GMEM_STRIDE = 528
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -2405,10 +2413,18 @@ def _cache_block_stride_bytes(
     )
 
     if int(model_type) in (int(ModelType.GLM_NSA), int(ModelType.GLM_NOPE)):
-        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32), 432B
-        # or 368B (GLM_NSA NVFP4), 288B or 304B (GLM_NOPE NVFP4).
-        # ``record_bytes`` comes from traits.kv_gmem_stride.
-        rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
+        # GLM-family per-token contiguous record: 656B (GLM_NSA
+        # ARBITRARY_FP32), 432B or 368B (GLM_NSA NVFP4), 288B or 304B
+        # (GLM_NOPE NVFP4), 528B (GLM_NOPE FP8 / fp8_ds_mla).
+        if record_bytes is not None:
+            rec = int(record_bytes)
+        elif int(model_type) == int(ModelType.GLM_NOPE):
+            # No default-656 on the NoPE path: a rope-less model can never
+            # carry the rope-bearing 656B record (R7 gap G6 -- the 656
+            # default must be unreachable for fp8 NoPE).
+            rec = _GLM_NOPE_GMEM_STRIDE
+        else:
+            rec = _GLM_KV_GMEM_STRIDE
         if cache.ndim >= 3:
             # GLM record walk: derive the per-block byte stride from the
             # per-layer VIEW the staged KV interface emits ([blocks, page,
@@ -2977,6 +2993,34 @@ def run_unified_decode(
                     f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
                 )
             fp8_rope_override = record_bytes == 368
+    if scale_format == ScaleFormat.ARBITRARY_FP32 and fp8_rope_override is None:
+        # FP8 (inline fp32 scales) record-width validation -- the
+        # ARBITRARY_FP32 twin of the NVFP4 arm above (FINDINGS fix-proposal
+        # 4 / R7 gap G5). A GLM_NOPE cache must be the 528-byte rope-less
+        # fp8_ds_mla record (512B e4m3 latent + 16B inline fp32 scales;
+        # pooled_indexer.py:64 _MLA_RECORD_BYTES=528) -- the 656B record is
+        # the rope-bearing V3.2/NSA shape and is ILLEGAL for a rope-less
+        # model. Before the VLLM_B12X_FP8_KV gate opened this path, a 528B
+        # FP8 cache could not reach the kernel (b12x_mla_sparse refused
+        # head-512 + fp8 upstream), so this arm never fires when the gate
+        # is off. fp8_rope is an NVFP4-only concept (the 368B E4M3 rope
+        # tail); it is forced False here like the NoPE arm above.
+        record_bytes = int(swa_k_cache.shape[-1])
+        if int(model_type) == int(ModelType.GLM_NOPE):
+            if record_bytes != _GLM_NOPE_GMEM_STRIDE:
+                raise ValueError(
+                    "GLM_NOPE FP8 cache record must be 528 bytes "
+                    "(512B e4m3 latent + 16B inline fp32 scales, no rope "
+                    f"tail); got {record_bytes}"
+                )
+            fp8_rope_override = False
+        else:
+            if record_bytes != _GLM_KV_GMEM_STRIDE:
+                raise ValueError(
+                    "FP8 cache record must be 656 bytes (rope-bearing "
+                    f"ARBITRARY_FP32); got {record_bytes}"
+                )
+            fp8_rope_override = False
     # FAIL-CLOSED: the per-token fp32 latent scale lives only in the widened
     # NVFP4 record -- bytes [292, 296) of the GLM_NSA fp8-rope 368-byte record,
     # or bytes [288, 292) of the GLM_NOPE 304-byte record.
@@ -3005,13 +3049,18 @@ def run_unified_decode(
         fp8_rope=fp8_rope_override,
         latent_scale_per_token=bool(latent_scale_per_token),
     )
-    if scale_format == ScaleFormat.NVFP4_E4M3 and int(swa_k_cache.shape[-1]) != int(
-        traits.kv_gmem_stride
-    ):
+    if scale_format in (
+        ScaleFormat.NVFP4_E4M3,
+        ScaleFormat.ARBITRARY_FP32,
+    ) and int(swa_k_cache.shape[-1]) != int(traits.kv_gmem_stride):
+        # FAIL-CLOSED on the FP8 path too (R7 gap G5): the view's trailing
+        # byte extent must equal the traits stride that sizes every IO walk.
+        # For NVFP4 this was already enforced; ARBITRARY_FP32 joins with the
+        # 528B GLM_NOPE fp8_ds_mla record.
         raise ValueError(
-            "NVFP4 cache record width disagrees with fp8_rope_override: "
+            "cache record width disagrees with traits.kv_gmem_stride: "
             f"got {int(swa_k_cache.shape[-1])} bytes, expected "
-            f"{int(traits.kv_gmem_stride)}"
+            f"{int(traits.kv_gmem_stride)} (scale_format={int(scale_format)})"
         )
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
 
@@ -3243,7 +3292,17 @@ def run_unified_decode(
         # (the historical workspace.page_size = 64) when the view's shape[1]
         # is not a valid SM120 page size.
         swa_page_size = int(swa_k_cache.shape[1])
-        if swa_page_size not in (32, 64):
+        # 256 joins the valid set for the FP8 tail-bearing ABI: the r7 C4
+        # page tail quantizes at 256-token groups (pooled_indexer.py:302-305
+        # block % 256 == 0; REFERENCE-VALIDATION.md §1.1), so the allocator
+        # tiles FP8 pools at 256-token parent pages and the view's own
+        # shape[1] IS the kernel page for them. The dummy-warmup rejection
+        # semantics are unchanged (a warmup dummy is never 256-deep).
+        _valid_pages = (32, 64, 256) if (
+            int(model_type) == int(ModelType.GLM_NOPE)
+            and int(scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        ) else (32, 64)
+        if swa_page_size not in _valid_pages:
             swa_page_size = int(workspace.page_size)
     stride_kv_block = _cache_block_stride_bytes(
         swa_k_cache,

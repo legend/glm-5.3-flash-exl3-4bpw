@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections import Counter
 from collections.abc import Collection
 from dataclasses import dataclass, fields, replace
@@ -645,6 +646,51 @@ class MLAAttentionSpec(FullAttentionSpec):
         super().__post_init__()
         if self.page_tail_bytes_per_token < 0:
             raise ValueError("page_tail_bytes_per_token must be non-negative")
+        if self.model_version == "glm_nope_fp8":
+            # Validated NoPE-FP8 ABI (pooled_indexer.py:64
+            # _MLA_RECORD_BYTES=528; REFERENCE-VALIDATION.md §1.1). The
+            # record is 528B -- 512B e4m3 latent + 16B inline fp32 scales --
+            # so a rope-bearing 656 override can never size this pool, and
+            # the C4 tail (33 B/token == 8448/256) only pairs with parent
+            # pages whose stride stays 8448-aligned (block % 256 == 0).
+            if self.cache_dtype_str != "fp8_ds_mla":
+                raise ValueError(
+                    "model glm_nope_fp8 requires kv-cache-dtype fp8_ds_mla; "
+                    f"got {self.cache_dtype_str!r}"
+                )
+            content = self.state_content_bytes
+            if content is None:
+                content = (self.head_size + self.head_size_v) * get_dtype_size(
+                    self.dtype
+                )
+            if content != 528:
+                raise ValueError(
+                    "fp8_ds_mla NoPE record must be 528 bytes (512B e4m3 "
+                    f"latent + 16B inline fp32 scales); got {content} -- a "
+                    "656 value is the rope-bearing V3.2/NSA shape"
+                )
+            if self.page_tail_bytes_per_token not in (0, 33):
+                raise ValueError(
+                    "glm_nope_fp8 page tail must be 0 (528-only) or 33 "
+                    "(the r7 C4 tail, 8448/256); got "
+                    f"{self.page_tail_bytes_per_token}"
+                )
+            if self.page_tail_bytes_per_token:
+                if self.block_size % 256 != 0:
+                    raise ValueError(
+                        "fp8_ds_mla with the 33B/token C4 tail requires "
+                        "block_size % 256 == 0 (r7 stride contract); got "
+                        f"block_size={self.block_size} -- boot 528-only "
+                        "(tail 0) or re-tile the pool at block 256"
+                    )
+                parent_page = self.block_size * (
+                    content + self.page_tail_bytes_per_token
+                )
+                if parent_page % 8448 != 0:
+                    raise ValueError(
+                        f"FP8 parent page stride {parent_page} is not "
+                        "8448-aligned (r7 C4 tail contract)"
+                    )
         if self.compress_ratio is None:
             object.__setattr__(self, "compress_ratio", self.tokens_per_state)
         elif self.compress_ratio != self.tokens_per_state:
@@ -1509,6 +1555,18 @@ def get_mla_kv_model_version(
         and getattr(hf_text_config, "kv_lora_rank", None) == 512
     ):
         return "glm_nope"
+    if (
+        kv_cache_dtype == "fp8_ds_mla"
+        and getattr(hf_text_config, "qk_rope_head_dim", None) == 0
+        and getattr(hf_text_config, "kv_lora_rank", None) == 512
+        and os.environ.get("VLLM_B12X_FP8_KV", "0") == "1"
+    ):
+        # G4 (FINDINGS fact 4): fp8 resolved to None -- the structural hole
+        # that let the rope-bearing 656 default through for a rope-less
+        # model. The validated NoPE-FP8 ABI (pooled_indexer.py:64
+        # _MLA_RECORD_BYTES=528; REFERENCE-VALIDATION.md) is its own model
+        # version, keyed to the same opt-in env as the b12x backend gate.
+        return "glm_nope_fp8"
     return None
 
 

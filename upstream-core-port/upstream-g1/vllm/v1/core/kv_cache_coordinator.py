@@ -490,6 +490,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        eagle_drop_exempt: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -505,6 +506,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        self.eagle_drop_exempt = eagle_drop_exempt
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -577,6 +579,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        eagle_drop_exempt: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -592,6 +595,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        self.eagle_drop_exempt = eagle_drop_exempt
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
         # different KV cache groups have different block sizes, the actual block size
@@ -862,7 +866,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     continue
 
-                drop_eagle_block = use_eagle and idx not in eagle_verified
+                # [PREFIX-GAP Stage B] dflash (draft state independent of
+                # target GDN, env-gated via VLLM_DFLASH_REPLAY_BOUNDARY) does
+                # not need the eagle drop; the MTP draft tail is
+                # lookahead-dependent and keeps it.
+                drop_eagle_block = (
+                    use_eagle
+                    and idx not in eagle_verified
+                    and not (
+                        self.eagle_drop_exempt
+                        and not isinstance(spec, MambaSpec)
+                    )
+                )
 
                 _max_length = curr_hit_length
                 # Eagle matches one extra drop unit (one hash unit for
@@ -979,6 +994,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    eagle_drop_exempt: bool = False,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -993,6 +1009,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            eagle_drop_exempt=eagle_drop_exempt,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -1008,6 +1025,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            eagle_drop_exempt=eagle_drop_exempt,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,

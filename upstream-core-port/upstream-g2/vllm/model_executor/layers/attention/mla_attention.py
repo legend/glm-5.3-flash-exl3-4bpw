@@ -303,6 +303,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     get_kv_quant_mode,
+    get_mla_kv_model_version,
 )
 
 logger = init_logger(__name__)
@@ -1416,6 +1417,29 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        # fp8_ds_mla record ABI (the width authority:
+        # opt-work/fp8-native/staged/fp8_kv_record_abi.py): 528B NoPE
+        # (512B e4m3 latent + 16B inline fp32 scales, qk_rope_head_dim==0;
+        # pooled_indexer.py:64 _MLA_RECORD_BYTES=528) or 656B rope-bearing
+        # (kv_lora_rank=512 + qk_rope_head_dim=64, head_size=576). The old
+        # unconditional 656 override was the rope-bearing V3.2/NSA shape
+        # leaking onto the NoPE model. NoPE-fp8 requires the validated ABI
+        # (get_mla_kv_model_version -> "glm_nope_fp8", gated by
+        # VLLM_B12X_FP8_KV in the interface); MLAAttentionSpec.__post_init__
+        # (0007) fail-closes any 656 override for that model version.
+        _is_fp8 = self.kv_cache_dtype == "fp8_ds_mla"
+        _model_version = None
+        _state_content_bytes = None
+        if _is_fp8:
+            if self.qk_rope_head_dim == 0:
+                _model_version = get_mla_kv_model_version(
+                    self.kv_cache_dtype, vllm_config.model_config.hf_text_config
+                )
+                _state_content_bytes = (
+                    528 if _model_version == "glm_nope_fp8" else 656
+                )
+            else:
+                _state_content_bytes = 656
         common_kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1423,9 +1447,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # fp8_ds_mla: 656-byte custom layout (kv_lora_rank=512 +
-            # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
-            state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
+            state_content_bytes=_state_content_bytes,
+            model_version=_model_version,
         )
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(

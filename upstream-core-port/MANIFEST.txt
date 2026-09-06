@@ -94,3 +94,9 @@ upstream-g4/vllm/v1/attention/backends/utils.py -> /opt/infernal-invocation/vllm
 upstream-g4/vllm/v1/kv_cache_layout.py -> /opt/infernal-invocation/vllm/vllm/v1/kv_cache_layout.py
 chat/protocol.py -> /opt/infernal-invocation/vllm/vllm/entrypoints/openai/chat_completion/protocol.py
 chat/chat_template.multimodal.jinja -> /opt/glm53/chat_template.multimodal.jinja
+r7-b12x/b12x/attention/_shared/mla/io.py -> /opt/infernal-invocation/b12x/b12x/attention/_shared/mla/io.py
+r7-b12x/b12x/attention/_shared/mla/io_mg.py -> /opt/infernal-invocation/b12x/b12x/attention/_shared/mla/io_mg.py
+r7-b12x/b12x/attention/_shared/mla/prefill_mg.py -> /opt/infernal-invocation/b12x/b12x/attention/_shared/mla/prefill_mg.py
+r7-b12x/b12x/attention/_shared/mla/traits.py -> /opt/infernal-invocation/b12x/b12x/attention/_shared/mla/traits.py
+r7-b12x/b12x/b12x/attention/_shared/mla/kv_cache.py -> /opt/infernal-invocation/b12x/b12x/attention/_shared/mla/kv_cache.py
+r7/vllm/v1/attention/backends/mla/b12x_mla_sparse.py -> /opt/infernal-invocation/vllm/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
