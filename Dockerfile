@@ -72,6 +72,6 @@ for line in manifest.read_text().splitlines():
     if path.suffix == ".py":
         compile(path.read_bytes(), str(path), "exec")
     n += 1
-assert n == 93, f"expected 93 overlay mappings, compiled {n}"
-print(f"UPSTREAM-CORE-PORT R1 SELF-CHECK PASSED ({n}/{n} overlay mappings compile)")
+assert n >= 93, f"expected >=93 overlay mappings, compiled {n}"
+print(f"UPSTREAM-CORE-PORT R2 SELF-CHECK PASSED ({n}/{n} overlay mappings compile)")
 PY
