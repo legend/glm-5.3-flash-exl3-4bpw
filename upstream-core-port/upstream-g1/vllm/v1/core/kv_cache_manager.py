@@ -168,6 +168,22 @@ class KVCacheManager:
                 "blocks to protect freshly cached session states.",
                 self.mamba_state_reserve, self.mamba_state_reserve,
             )
+        # [MAMBA-RESERVE-AGE] Starvation escape for the reserve gate. A
+        # first allocation blocked SOLELY by the reserve (it would fit
+        # without it) accumulates blocked scheduling attempts; after
+        # ``VLLM_MAMBA_STATE_PROTECT_AGE`` attempts the reserve no longer
+        # applies to that request, so admission pressure always converts
+        # into allocation — which is the only place stale evictable-cached
+        # entries are reclaimed (BlockPool.get_new_blocks). Without this,
+        # a whale whose honest demand + reserve permanently exceeds the
+        # free ceiling is queued forever and the scheduler's head-of-line
+        # break stalls the whole waiting queue behind it. 0 = never age
+        # out (legacy behavior). Inactive when the reserve is unset.
+        self.mamba_reserve_age = max(
+            0, int(os.environ.get("VLLM_MAMBA_STATE_PROTECT_AGE", "128") or 0)
+        )
+        self._reserve_blocked: dict[str, int] = {}
+        self._reserve_aged_logged: set[str] = set()
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
@@ -502,9 +518,26 @@ class KVCacheManager:
             m.req_to_blocks.get(request.request_id)
             for m in self.coordinator.single_type_managers
         )
-        state_reserve = (
-            self.mamba_state_reserve if is_first_allocation else 0
+        reserve_blocked_attempts = self._reserve_blocked.get(request.request_id, 0)
+        reserve_aged_out = (
+            self.mamba_state_reserve
+            and self.mamba_reserve_age
+            and reserve_blocked_attempts >= self.mamba_reserve_age
         )
+        state_reserve = (
+            self.mamba_state_reserve
+            if is_first_allocation and not reserve_aged_out
+            else 0
+        )
+        if reserve_aged_out and request.request_id not in self._reserve_aged_logged:
+            self._reserve_aged_logged.add(request.request_id)
+            logger.warning(
+                "VLLM_MAMBA_STATE_PROTECT: request %s blocked by the admission "
+                "reserve for %d scheduling attempts; aging out the reserve for "
+                "it so admission pressure can proceed (the resulting allocation "
+                "reclaims stale evictable-cached entries).",
+                request.request_id, reserve_blocked_attempts,
+            )
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -523,7 +556,18 @@ class KVCacheManager:
             required_blocks = (
                 num_blocks_to_allocate + watermark_blocks + state_reserve
             )
+            required_without_reserve = (
+                num_blocks_to_allocate + watermark_blocks
+            )
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if state_reserve and (
+                    required_without_reserve
+                    <= self.block_pool.get_num_free_blocks()
+                ):
+                    # Blocked solely by the reserve: feed the aging escape.
+                    self._reserve_blocked[request.request_id] = (
+                        reserve_blocked_attempts + 1
+                    )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -556,15 +600,16 @@ class KVCacheManager:
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
-
         # [MAMBA-STATE-PROTECT] On a request's first allocation the
-        # incremental count undercounts a long prompt (the align trickle
-        # reports 1-3 blocks for what will hold cdiv(prompt, block) + spec +
-        # checkpoint). Gate the admission on the honest full-sequence
-        # requirement plus the reserve, or the guarantee is void exactly in
-        # the shallow-ring regime it exists for. Running requests are exempt
-        # (is_first_allocation false), so decode never stalls on the reserve
-        # and the ring always deepens.
+        # incremental trickle reports only the current chunk's growth, which
+        # cannot see the rest of the sequence's demand. Gate the admission on
+        # the honest full-sequence requirement (the admission cap, billed
+        # null-slot-free for align mode — see MambaManager) plus the reserve,
+        # or the guarantee is void exactly in the shallow-ring regime it
+        # exists for. Running requests are exempt (is_first_allocation
+        # false), so decode never stalls on the reserve and the ring always
+        # deepens. The aging escape below keeps a reserve-blocked admission
+        # from becoming permanent.
         if state_reserve:
             full_num_tokens = min(request.num_tokens, self.max_model_len)
             honest_demand = self.coordinator.get_num_blocks_to_allocate(
@@ -592,7 +637,17 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            if state_reserve and (
+                required_blocks - state_reserve <= available_blocks
+            ):
+                # Blocked solely by the reserve: feed the aging escape.
+                self._reserve_blocked[request.request_id] = (
+                    reserve_blocked_attempts + 1
+                )
             return None
+        if is_first_allocation:
+            # Admitted: the aging escape's streak is done.
+            self._reserve_blocked.pop(request.request_id, None)
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -643,6 +698,9 @@ class KVCacheManager:
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
             self.block_pool.free_blocks(pins)
+        # [MAMBA-RESERVE-AGE] drop the aging-escape streak with the request.
+        self._reserve_blocked.pop(request.request_id, None)
+        self._reserve_aged_logged.discard(request.request_id)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

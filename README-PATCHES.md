@@ -194,3 +194,26 @@ On top of r1.1, all peer-verified and benchmarked (llm-inference-bench A/B):
   host metadata; enable via VLLM_FUSED_DRAFT_DECODE=1 if a case appears).
 - **Prefix retention (VLLM_PREFIX_CACHE_RETENTION_INTERVAL)**: mamba boundary
   states survive request completion (15,616 legal max on nvfp4).
+
+## Release r2.1 — admission deadlock fix (2026-09-07)
+
+Community-reported (RunTime_Terror, r2 fork, FP8 KV, 1M window): engine
+wedges when a >200k session arrives while another decodes — all requests
+(including new ones) queue forever. Root cause: the align-mode admission
+cap bills null slots as real demand (cdiv(prompt, block) + spec per mamba
+group, ~10x inflation), so VLLM_MAMBA_STATE_PROTECT's gate refuses a
+request that would actually fit; eviction only runs during allocation and
+the scheduler breaks its waiting loop on first refusal — self-sustaining.
+
+Fixes (all verified red/green on the real classes):
+- 0004: the align cap bills the real footprint (spec+2+ckpt+partial per
+  mamba group, prompt-length-independent). Kill-switch
+  VLLM_MAMBA_ALIGN_CAP_LEGACY=1.
+- 0005: starvation backstop — a request blocked solely by the reserve for
+  VLLM_MAMBA_STATE_PROTECT_AGE attempts (default 128) is admitted on
+  demand alone.
+- 0006: deferred frees drain on 0-token steps too (a fully-refused
+  scheduler can no longer hold the last request's blocks out of the pool).
+
+Gate-off behavior is bit-identical (harness-verified both stacks). With the
+patch the reserve can stay ON: cache-hit protection survives churn rounds.

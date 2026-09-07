@@ -636,25 +636,14 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # OPT (opt/investigation, scheduler area): decode-aware prefill cap
-        # (Fix B, ported onto Fix A's throttle release). When any decode
-        # request is in flight, cap the prefill chunk budget so the chunk
-        # window (the dominant GPU cost at 100k ctx) shrinks instead of
-        # monopolizing the whole max_num_batched_tokens budget. At long
-        # context the chunk cost is ~linear in chunk length, so a 512-token
-        # cap cuts decode ITL ~4x for ~-9% prefill throughput. With no
-        # decodes in flight, chunks keep the full budget.
-        num_decode_reqs = sum(
-            not r.is_prefill_chunk for r in self.running
-        )
-        chunk_cap = (
-            self.max_num_scheduled_tokens
-            if num_decode_reqs == 0
-            else max(
-                self.max_num_scheduled_tokens // 4,
-                self.scheduler_config.max_num_seqs,
-            )
-        )
+        # OPT 2026-09-06: Fix B's decode-aware chunk cap REMOVED (see
+        # commit 8e0567d rationale: obsolete after the cache-wipe fix;
+        # interval-only decode protection verified at ITL p95 22ms).
+        # The small-prefill priority feature is NOT in this version: two
+        # shipping attempts crashed on unverified interface assumptions
+        # (self._class attr scope; RequestStatus.QUEUED enum member). It
+        # must be re-derived against the real request_queue/RequestStatus
+        # API with an in-container multi-request harness before it returns.
 
         # OPT (opt/investigation, scheduler area): prefill throttle release.
         # The stock release (prefill_capacity_bound = bool(self.waiting)) latches
@@ -709,9 +698,6 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if request.is_prefill_chunk:
-                # OPT: decode-aware prefill cap (see chunk_cap above).
-                num_new_tokens = min(num_new_tokens, chunk_cap)
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
@@ -1120,10 +1106,6 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
-                    if num_new_tokens > chunk_cap:
-                        # OPT: decode-aware prefill cap — admit the head request
-                        # as a chunk within the cap instead of the full budget.
-                        num_new_tokens = chunk_cap
                     assert num_new_tokens > 0
 
                     # Apply Mamba alignment before encoder caps.
@@ -1967,9 +1949,18 @@ class Scheduler(SchedulerInterface):
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
-        # Every GPU write enqueued by this and earlier steps has completed, so it is
-        # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+        # [DEFER-FREE-DRAIN] Every GPU write enqueued by this and earlier
+        # steps has completed once their outputs were processed, so it is
+        # safe to return deferred-free blocks to the pool. Drain on every
+        # update — including fully-refused 0-token steps. Gating on
+        # ``total_num_scheduled_tokens`` let the last request's deferred
+        # blocks stay out of the pool forever once the scheduler stopped
+        # producing non-empty steps (e.g. a waiting queue wedged on the
+        # admission gate), so ``get_num_free_blocks`` never recovered and
+        # the refusal became self-sustaining. ``_drain_deferred_frees``
+        # still stops at the first fence above ``processed_step_seq``, so
+        # fences of steps whose outputs have not arrived are untouched.
+        if self.defer_block_free:
             self.processed_step_seq += 1
             self._drain_deferred_frees()
 

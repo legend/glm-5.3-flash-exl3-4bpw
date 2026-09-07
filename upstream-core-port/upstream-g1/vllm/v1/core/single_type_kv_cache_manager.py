@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -1414,6 +1415,12 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # [MAMBA-ALIGN-CAP] Admission-cap billing mode. Default bills the real
+        # (null-slot-excluded) align footprint; VLLM_MAMBA_ALIGN_CAP_LEGACY=1
+        # restores the pre-fix position-count billing.
+        self._align_cap_legacy: bool = (
+            os.environ.get("VLLM_MAMBA_ALIGN_CAP_LEGACY", "0") == "1"
+        )
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1690,17 +1697,37 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._num_checkpoint_blocks[request_id] = checkpoint_block
             if apply_admission_cap:
                 # Full-sequence admission gate (allocate_slots
-                # full_sequence_must_fit): report the real requirement for the
-                # whole sequence. The incremental trickle below collapses the
-                # count to ~1-3 blocks, so the gate under-counts align-mode
-                # requests by cdiv(prompt, block_size) - ~3 blocks (~10 slots
-                # for a 100k prompt), over-admits until the pool exhausts, and
-                # running requests end up preempted and re-prefilled.
-                num_new_blocks = (
-                    max(num_new_blocks, 1)
-                    + int(has_partial_hit)
-                    + checkpoint_block
-                )
+                # full_sequence_must_fit). Bill the request's REAL
+                # full-sequence pool footprint, not the req_to_blocks
+                # position count: in align mode every position below
+                # ``num_skipped_blocks`` is filled with the SHARED null
+                # block (see allocate_new_blocks), which holds no pool
+                # slot. The steady-state hold is the rolling state window
+                # (spec blocks + current state + one recycling margin) plus
+                # the internal checkpoint and a partial-hit CoW block —
+                # bounded regardless of prompt length. Billing
+                # ``cdiv(num_tokens, block_size)`` here over-charged a
+                # long-prompt admission by the null-slot count per mamba
+                # group (e.g. ~52 of 58 positions for a 257k prompt at
+                # block 4,480), which with the admission reserve made the
+                # gate refuse forever (self-sustaining: eviction only runs
+                # during allocation and the gate blocks allocation) while
+                # the request was actually runnable. VLLM_MAMBA_ALIGN_CAP_LEGACY=1
+                # restores the pre-fix billing.
+                if self._align_cap_legacy:
+                    num_new_blocks = (
+                        max(num_new_blocks, 1)
+                        + int(has_partial_hit)
+                        + checkpoint_block
+                    )
+                else:
+                    num_new_blocks = max(
+                        self.num_speculative_blocks
+                        + 2
+                        + checkpoint_block
+                        + int(has_partial_hit),
+                        1,
+                    )
                 if request_id not in self._allocated_block_reqs:
                     num_new_blocks += self.num_speculative_blocks
             elif num_new_blocks > 0:
