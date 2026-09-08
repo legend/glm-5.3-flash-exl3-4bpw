@@ -217,3 +217,33 @@ Fixes (all verified red/green on the real classes):
 
 Gate-off behavior is bit-identical (harness-verified both stacks). With the
 patch the reserve can stay ON: cache-hit protection survives churn rounds.
+
+## Release r2.2 — grammar request engine-death fix (2026-09-09)
+
+Reproduced on production (agentic harness new-session flow): the first POST
+of a new session fires two concurrent requests — the main request (plain, no
+structured outputs) and a title-generation request carrying a structural_tag
+grammar. The mixed batch (grammar + plain) kills the engine: both in-flight
+requests 500 with `EngineDeadError`, `/health` goes 503 until restart. One
+crash per new session — the only grammar requests are title generations.
+
+Root cause: the `[FORK-COMPAT]` grammar shim in
+`upstream-g3/vllm/v1/worker/gpu/model_runner.py` `sample()`. The in-image v84
+`StructuredOutputsWorker.apply_grammar_bitmask` requires
+`grammar_num_spec_tokens`; upstream dropped the argument. The shim's fallback
+billed `[0] * num_reqs` — one entry per batch request (the worker expects one
+per *grammar* request, so mixed batches fail the length assert) with zero
+counts (the worker's `num_active_drafts <= num_source_drafts` assert fails on
+any spec step where a grammar request carries scheduled MTP3 draft tokens).
+All-grammar batches pass accidentally (`len(ids) == num_reqs`), which is why
+the bug stayed latent until the new-session title flow created the first
+mixed batch.
+
+Fix: one entry per grammar request with the request's real scheduled draft
+count from `num_draft_tokens_per_req` — the same field the worker reads for
+`num_active_drafts`, so the asserts hold by construction. 0 only for
+unknown/no-draft grammar requests.
+
+Verified red/green: single grammar replay (grammar-constrained output
+correct), the concurrent pair (both 200, engine alive), real harness traffic
+(the exact new-session reproduction), and the engine's grammar warmup path.

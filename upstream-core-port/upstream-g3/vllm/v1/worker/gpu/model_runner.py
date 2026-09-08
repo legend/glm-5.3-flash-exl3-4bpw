@@ -1795,9 +1795,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # [FORK-COMPAT] the in-image StructuredOutputsWorker requires
             # grammar_num_spec_tokens (v84 signature); upstream dropped the
             # arg. Probe the signature once and pass the fork kwarg with the
-            # per-request spec-token counts it expects (0 = no spec tokens
-            # applied to grammar rows upstream-style; v84 recomputes from
-            # input_batch where needed).
+            # per-request spec-token counts it expects. When the upstream
+            # grammar output lacks it, bill one entry per grammar request
+            # with the request's real scheduled draft count (0 only for
+            # unknown/no-draft requests).
             import inspect as _inspect_so
 
             _so_params = set(
@@ -1811,8 +1812,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     grammar_output, "grammar_num_spec_tokens", None
                 )
                 if _so_extra["grammar_num_spec_tokens"] is None:
-                    _n = input_batch.num_reqs
-                    _so_extra["grammar_num_spec_tokens"] = [0] * _n
+                    # One entry per grammar request with the request's real
+                    # scheduled draft count — the same field the worker reads
+                    # for num_active_drafts, so the asserts hold by
+                    # construction. Billing per batch request with zero
+                    # counts fails the worker's length assert on mixed
+                    # batches (grammar + plain) and its
+                    # num_active_drafts <= num_source_drafts assert on any
+                    # spec step where a grammar request carries scheduled
+                    # draft tokens.
+                    _rid_to_idx = {
+                        r: i for i, r in enumerate(input_batch.req_ids)
+                    }
+                    _nd = input_batch.num_draft_tokens_per_req
+                    counts = []
+                    for rid in grammar_output.structured_output_request_ids:
+                        idx = _rid_to_idx.get(rid)
+                        counts.append(
+                            int(_nd[idx])
+                            if (_nd is not None and idx is not None)
+                            else 0
+                        )
+                    _so_extra["grammar_num_spec_tokens"] = counts
             self.structured_outputs_worker.apply_grammar_bitmask(
                 logits,
                 input_batch,
