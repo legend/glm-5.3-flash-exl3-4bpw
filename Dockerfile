@@ -51,6 +51,9 @@ COPY upstream-core-port/engine-core/core.py /opt/infernal-invocation/vllm/vllm/v
 COPY upstream-core-port/chat/protocol.py /opt/infernal-invocation/vllm/vllm/entrypoints/openai/chat_completion/protocol.py
 COPY upstream-core-port/chat/chat_template.multimodal.jinja /opt/glm53/chat_template.multimodal.jinja
 
+# --- parser fix: emit completed tool calls with undeclared names ---
+COPY upstream-core-port/parser-fix/vllm/parser/engine/parser_engine.py /opt/infernal-invocation/vllm/vllm/parser/engine/parser_engine.py
+
 # --- manifest: overlay file -> in-image destination (93 mappings / 92 files) ---
 COPY upstream-core-port/MANIFEST.txt /opt/glm53/upstream-core-port-MANIFEST.txt
 

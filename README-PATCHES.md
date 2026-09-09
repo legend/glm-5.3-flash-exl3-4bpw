@@ -217,3 +217,47 @@ Fixes (all verified red/green on the real classes):
 
 Gate-off behavior is bit-identical (harness-verified both stacks). With the
 patch the reserve can stay ON: cache-hit protection survives churn rounds.
+
+## Release r2.3 — parser engine silent-drop fix (2026-09-09)
+
+Reproduced in production (opencode, GLM-5.3-Flash): the streaming parser
+engine silently drops **completed, well-formed tool calls** whose function
+name is not in the request's declared `tools` list. The `<invoke>` text is
+consumed as a tool-call region, the call is never emitted, and the turn ends
+with `finish_reason=stop` — the agent looks lazy, prematurely finishing its
+request, while in reality the engine was silently swallowing the call.
+Same symptom class reported by another user in the parser engine's original
+PR thread (vLLM PR #45915).
+
+Root cause: `ParserEngine._accept_tool_name()` gates tool-call emission at
+three sites — streaming name delta (~:823), TOOL_END (~:883), and
+non-streaming final extraction (~:1058). The gate exists for a good reason
+(upstream #39757: streaming emitted truncated name prefixes like `run_in`
+for `run_in_terminal`, amplified by MTP/spec-decode). But by TOOL_END and
+final extraction the call is complete: dropping it converts a recoverable
+"no such tool" client round-trip into an unrecoverable silent stop. The
+engine config default is `validate_tool_names=False`; `glm47_moe` (and
+`minimax_m2`) opted in.
+
+Fix: keep the mid-stream gate (truncated prefixes must never stream as
+names), but at TOOL_END and final extraction emit completed calls even when
+the name is undeclared, logging a warning. The client decides validity —
+the OpenAI tool-calling contract — and the model self-corrects from the
+client's error result in one step. Two call sites change; the mid-stream
+site is untouched; empty names (unparseable garbage) are still dropped.
+
+Verified (GLM-5.3-Flash EXL3-4bpw, MTP-3, live production box): captured
+the exact failing request body from the live engine (143 messages, 13
+declared tools, 127k-token history full of planka calls), then:
+
+| Test | Before fix | After fix |
+|---|---|---|
+| Replay captured body, stream=false | finish=stop, 0 tool_calls, raw `<invoke>` XML leaked into content | finish=tool_calls, planka call with correct args emitted |
+| Same body, stream=true | announce text only, then stop | tool_calls deltas stream, finish=tool_calls, undeclared name emitted |
+| Valid declared-tool calls | unaffected | unaffected |
+| Grammar/structured-output mixed batches | pass | pass |
+
+With the fix deployed, the owner's real session stopped producing "lazy"
+turns: the hidden call now reaches the harness, which replies its standard
+"Model tried to call unavailable tool ..." error, and the model adapts
+instead of wedging.
